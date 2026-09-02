@@ -121,6 +121,7 @@ if (CUDAToolkit_FOUND)
             template-instances/fattn-vec-instance-f16-f16.cu
             template-instances/fattn-vec-instance-q4_0-q4_0.cu
             template-instances/fattn-vec-instance-q8_0-q8_0.cu
+            template-instances/fattn-vec-instance-q8_0-q4_0.cu # 非对称 KV (K q8_0 / V q4_0), 缺失时回落 CPU
             template-instances/fattn-vec-instance-bf16-bf16.cu)
     endif()
 

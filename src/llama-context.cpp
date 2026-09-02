@@ -16,6 +16,7 @@
 #include "../ggml/src/ggml-backend-sched-impl.h"
 
 #include <cinttypes>
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <limits>
