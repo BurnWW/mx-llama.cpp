@@ -2,7 +2,7 @@
 #include "ggml-impl.h"
 #include "ggml-backend.h"
 
-#if defined(__linux__)
+#if defined(__linux__) && !defined(__ANDROID__)
 #include <execinfo.h>
 #endif
 #include "ggml-backend-impl.h"
@@ -203,6 +203,16 @@ static void ggml_backend_meta_device_event_synchronize(ggml_backend_dev_t /*dev*
     }
 }
 
+static bool ggml_backend_meta_device_event_query(ggml_backend_dev_t /*dev*/, ggml_backend_event_t event) {
+    auto * ev_ctx = (ggml_backend_meta_event_context *) event->context;
+    for (ggml_backend_event_t e : ev_ctx->simple_events) {
+        if (e->device->iface.event_query != nullptr && !e->device->iface.event_query(e->device, e)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static ggml_backend_t ggml_backend_meta_device_init_backend(ggml_backend_dev_t dev, const char * params);
 
 static ggml_backend_buffer_type_t ggml_backend_meta_device_get_buffer_type(ggml_backend_dev_t dev);
@@ -346,6 +356,7 @@ static const ggml_backend_device_i ggml_backend_meta_device_iface = {
     /* .event_new            = */ ggml_backend_meta_device_event_new,
     /* .event_free           = */ ggml_backend_meta_device_event_free,
     /* .event_synchronize    = */ ggml_backend_meta_device_event_synchronize,
+    /* .event_query          = */ ggml_backend_meta_device_event_query,
 };
 
 static bool ggml_backend_dev_is_meta(ggml_backend_dev_t dev) {
@@ -1584,10 +1595,9 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
         t_ij->flags = tensor->flags;
         memcpy(t_ij->op_params, tensor->op_params, sizeof(tensor->op_params));
 
-        // A row-sharded gather (see handle_get_rows) needs two scalars per device: the
-        // global row where this device's table slice starts, and the offset of its own
-        // block inside the shared index tensor. Both become pointer shifts at dispatch,
-        // so no gather kernel has to know about sharding. GET_ROWS carries no op_params
+        // A row-sharded gather (see handle_get_rows) needs the global row where this
+        // device's table slice starts. It becomes a pointer shift at dispatch, so no
+        // gather kernel has to know about sharding. GET_ROWS carries no op_params
         // otherwise, so zero is the unsharded path every other model takes.
         // Keyed on the SOURCE being sharded, not on the destination's axis: the gather
         // output is PARTIAL, so a dst-axis test never fires and the row offset would
@@ -1601,10 +1611,6 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
                     for (size_t k = 0; k < j; k++) {
                         row_off += ss0.ne[s*n_simple_bufs + k]*ss0.nr[s];
                     }
-                }
-                int64_t idx_off = 0;
-                for (size_t k = 0; k < j; k++) {
-                    idx_off += split_state.ne[k]*split_state.nr[0];
                 }
                 GGML_ASSERT(row_off <= INT32_MAX);
                 t_ij->op_params[0] = (int32_t) row_off;
@@ -3115,7 +3121,7 @@ static void ggml_backend_meta_synchronize(ggml_backend_t backend) {
         }
         const double waited = ggml_time_us()/1000.0 - t0;
         fprintf(stderr, "[chunk] sync  t=%9.3f ms waited=%.3f ms\n", t0, waited);
-#if defined(__linux__)
+#if defined(__linux__) && !defined(__ANDROID__)
         // name the caller of any expensive drain - every extern frame
         // symbolizes, which is enough to attribute the wait
         if (waited > 50.0) {

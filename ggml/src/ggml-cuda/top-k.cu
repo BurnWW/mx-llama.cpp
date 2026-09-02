@@ -110,11 +110,19 @@ static __global__ void k_topk_remap(
 
 // Direct top-k for small k: one block per row, one pass over the row.
 // Each thread keeps a descending top-K list in registers; the insertion is an
-// unrolled compare-swap cascade so every index stays compile-time and nothing
-// spills. The block then extracts k winners by repeated block-wide argmax.
-// Ties go to the lower index, which is what the argsort path produces.
+// unrolled compare-swap cascade so every index stays compile-time. The HIP
+// launch bound keeps the K=64 candidate state out of scratch while leaving
+// CUDA launch metadata unchanged. The block then extracts k winners by
+// repeated block-wide argmax. Ties go to the lower index, which is what the
+// argsort path produces.
+#if defined(GGML_USE_HIP)
+#define GGML_TOP_K_LAUNCH_BOUNDS(n) __launch_bounds__(n)
+#else
+#define GGML_TOP_K_LAUNCH_BOUNDS(n)
+#endif
+
 template <int K, int NT>
-static __global__ void k_topk_small(const float * __restrict__ x, int * __restrict__ dst,
+static __global__ GGML_TOP_K_LAUNCH_BOUNDS(NT) void k_topk_small(const float * __restrict__ x, int * __restrict__ dst,
                                     const int ncols, const int k) {
     const int row = blockIdx.x;
     const float * __restrict__ xr = x + (size_t) row * ncols;
@@ -205,18 +213,28 @@ static __global__ void k_topk_small(const float * __restrict__ x, int * __restri
     }
 }
 
-// The candidate array is NT*K*8 bytes, so threads scale inversely with K to
-// hold it at 32 KB. k up to 64 covers the sampler default of 40 as well as the
-// smaller k a speculative drafter uses; above that the sort paths still win.
+#undef GGML_TOP_K_LAUNCH_BOUNDS
+
+// The candidate array is NT*K*8 bytes. Threads scale inversely with K to hold it at 32 KB, or 16 KB on MUSA to fit its per-block shared-memory limit.
+// k up to 64 covers the sampler default of 40 as well as the smaller k a speculative drafter uses. Above that the sort paths still win.
 static bool top_k_small_cuda(const float * src, int * dst, const int64_t ncols,
                              const int64_t nrows, const int64_t k, cudaStream_t stream) {
     const dim3 grid((unsigned) nrows, 1, 1);
+#if defined(GGML_USE_MUSA)
+    constexpr int nt_k16 = 128;
+    constexpr int nt_k32 =  64;
+    constexpr int nt_k64 =  32;
+#else
+    constexpr int nt_k16 = 256;
+    constexpr int nt_k32 = 128;
+    constexpr int nt_k64 =  64;
+#endif
     if (k <= 16) {
-        k_topk_small<16, 256><<<grid, 256, 0, stream>>>(src, dst, (int) ncols, (int) k);
+        k_topk_small<16, nt_k16><<<grid, nt_k16, 0, stream>>>(src, dst, (int) ncols, (int) k);
     } else if (k <= 32) {
-        k_topk_small<32, 128><<<grid, 128, 0, stream>>>(src, dst, (int) ncols, (int) k);
+        k_topk_small<32, nt_k32><<<grid, nt_k32, 0, stream>>>(src, dst, (int) ncols, (int) k);
     } else if (k <= 64) {
-        k_topk_small<64,  64><<<grid,  64, 0, stream>>>(src, dst, (int) ncols, (int) k);
+        k_topk_small<64, nt_k64><<<grid, nt_k64, 0, stream>>>(src, dst, (int) ncols, (int) k);
     } else {
         return false;
     }

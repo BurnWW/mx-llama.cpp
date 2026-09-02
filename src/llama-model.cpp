@@ -368,7 +368,7 @@ llama_model * llama_model_create(llama_model_loader & ml, const llama_model_para
 // a host resident, demand paged table: no VRAM, one PCIe read per token. The shard
 // splits the table across the TP group instead so the gather is local. Only -sm
 // tensor can split, so this does nothing in the other split modes.
-bool llama_ple_shard_enabled() {
+static bool llama_ple_shard_enabled() {
     static const bool enabled = [] {
         const char * s = getenv("LLAMA_PLE_SHARD");
         const bool on = s != nullptr && atoi(s) != 0;
@@ -2924,7 +2924,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         filter_recr = [&](uint32_t il) {
                             return hparams.is_recr(il) && hparams.n_ff(il) == 0;
                         };
-                    } else if (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE || arch == LLM_ARCH_QWEN4EXP || arch == LLM_ARCH_MINIMAX_01) {
+                    } else if (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE || arch == LLM_ARCH_QWEN4EXP) {
                         // Key the filters on which tensors the FILE actually has, not on
                         // layer arithmetic alone. A head-only export carries just the MTP
                         // block, so a purely arithmetic filter admits trunk layers that were
