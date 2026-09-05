@@ -1966,6 +1966,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
         }
 
+        // A previous task's failed replay must not permanently mute drafting for the
+        // rest of the session: each task gets a fresh chance. process_decode() guards
+        // against stale draft KV (sequence resets), so a transient failure here only
+        // costs this task's drafts.
+        deferred_prefill_failed = false;
+
         // Deferred prefill: the target prompt has now been prefilled (without a per-chunk
         // sync) and its pre-norm hidden is staged in prefill_accum. Build the draft KV in
         // one pass here, before generation starts, so the draft quality is identical to the
@@ -2048,6 +2054,21 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
 
             auto * mem_dft = llama_get_memory(ctx_dft);
+
+            // Sequence reset (slot eviction, KV restore, checkpoint rollback) can move the
+            // target back to positions at or below what the draft context already mirrors.
+            // M-RoPE models hard-require X < Y (see llama_batch_allocr::init), so a stale
+            // draft KV makes every mirror decode fail with rc=-1. Clear the draft sequence
+            // when the batch starts at or before its last stored position; the mirror below
+            // rebuilds it from scratch.
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                if (i_batch_beg[seq_id] < 0) {
+                    continue;
+                }
+                if (positions[i_batch_beg[seq_id]] <= llama_memory_seq_pos_max(mem_dft, seq_id)) {
+                    llama_memory_seq_rm(mem_dft, seq_id, 0, -1);
+                }
+            }
 
             bool ok = true;
             for (int head = 0; head < n_mtp_layers; ++head) {
