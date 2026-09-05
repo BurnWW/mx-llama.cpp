@@ -22,6 +22,7 @@
 #include <string.h>
 #include <inttypes.h>
 #include <algorithm>
+#include <unordered_map>
 #include <vector>
 
 #ifdef __APPLE__
@@ -66,6 +67,14 @@ size_t ggml_backend_buft_get_alloc_size(ggml_backend_buffer_type_t buft, const s
     if (buft->iface.get_alloc_size) {
         size_t size = buft->iface.get_alloc_size(buft, tensor);
         assert(size >= ggml_nbytes(tensor));
+
+        // [TAG_ALLOC_SIZE_EXPAND]
+        // if you hit this assert, update ggml_backend_op_alloc_size_may_expand() accordingly
+        GGML_ASSERT(size <= ggml_nbytes(tensor) ||
+                    ggml_op_is_empty(tensor->op) ||
+                    ggml_is_quantized(tensor->type) || // [TAG_ALLOC_SIZE_EXPAND]
+                    ggml_backend_op_alloc_size_may_expand(tensor->op));
+
         return size;
     }
     return ggml_nbytes(tensor);
@@ -572,10 +581,10 @@ void ggml_backend_event_wait(ggml_backend_t backend, ggml_backend_event_t event)
     backend->iface.event_wait(backend, event);
 }
 
-static void ggml_backend_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
+static void ggml_backend_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * cgraph, struct ggml_backend_graph_optimize_params * params) {
     GGML_ASSERT(backend);
     if (backend->iface.graph_optimize != NULL) {
-        backend->iface.graph_optimize(backend, cgraph);
+        backend->iface.graph_optimize(backend, cgraph, params);
     }
 }
 
@@ -868,6 +877,7 @@ struct ggml_backend_sched {
     int cur_copy;
     int next_copy;
     ggml_backend_event_t events[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_MAX_COPIES];
+    bool events_recorded[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_MAX_COPIES];
     struct ggml_tensor ** graph_inputs;
     int n_graph_inputs;
     int graph_inputs_capacity;
@@ -1793,11 +1803,40 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         sched->prev_leaf_backend_ids = tmp;
     }
 
+    // optimize the split graphs and collect the allocation dependencies added by the backends
+    // this needs to happen before we make graph_copy, so they are in sync
+    // TODO: this may create many small allocations in the scheduler, restructure to use a flat array
+    std::unordered_map<ggml_tensor *, std::vector<ggml_tensor *>> alloc_deps;
+
+    struct ggml_backend_graph_optimize_params opt_params = {
+        /* .add_alloc_dep = */ [](void * user_data, ggml_tensor * tensor, ggml_tensor * until) {
+            auto & deps = *(std::unordered_map<ggml_tensor *, std::vector<ggml_tensor *>> *) user_data;
+            std::vector<ggml_tensor *> & keep = deps[until];
+            if (std::find(keep.begin(), keep.end(), tensor) == keep.end()) {
+                keep.push_back(tensor);
+            }
+        },
+        /* .user_data     = */ &alloc_deps,
+    };
+
+    for (int i = 0; i < sched->n_splits; i++) {
+        struct ggml_backend_sched_split * split = &sched->splits[i];
+        split->graph = ggml_graph_view(graph, split->i_start, split->i_end);
+
+        ggml_backend_graph_optimize(sched->backends[split->backend_id], &split->graph, &opt_params);
+    }
+
+    // each dep is added to graph_copy as a GGML_OP_NONE node with the kept tensors as srcs
+    int n_dep_nodes = 0;
+    for (const auto & it : alloc_deps) {
+        n_dep_nodes += (it.second.size() + GGML_MAX_SRC - 1) / GGML_MAX_SRC;
+    }
+
     int total_inputs = sched->n_graph_inputs;
     for (int i = 0; i < sched->n_splits; i++) {
         total_inputs += sched->splits[i].n_inputs;
     }
-    int graph_size = std::max(graph->n_nodes, graph->n_leafs) + total_inputs * 2 * sched->n_copies;
+    int graph_size = std::max(graph->n_nodes, graph->n_leafs) + total_inputs * 2 * sched->n_copies + n_dep_nodes;
 
     // remember the actual graph_size for performing reallocation checks later [GGML_SCHED_DEBUG_REALLOC]
     sched->debug_prev_graph_size = sched->debug_graph_size;
@@ -1815,13 +1854,10 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
 
     struct ggml_cgraph * graph_copy = &sched->graph;
 
+    int n_dep_nodes_added = 0;
+
     for (int i = 0; i < sched->n_splits; i++) {
         struct ggml_backend_sched_split * split = &sched->splits[i];
-        split->graph = ggml_graph_view(graph, split->i_start, split->i_end);
-
-        // Optimize this split of the graph. This needs to happen before we make graph_copy,
-        // so they are in sync.
-        ggml_backend_graph_optimize(sched->backends[split->backend_id], &split->graph);
 
         // add inputs to the graph copy so that they are allocated by ggml-alloc at the start of the split
         for (int j = 0; j < split->n_inputs; j++) {
@@ -1846,8 +1882,31 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             assert(graph_copy->size > graph_copy->n_nodes);
             sched->node_backend_ids[graph_copy->n_nodes] = tensor_backend_id(graph->nodes[j]);
             graph_copy->nodes[graph_copy->n_nodes++] = graph->nodes[j];
+
+            if (alloc_deps.empty()) {
+                continue;
+            }
+
+            // add a dependency node so that the kept tensors are not freed before this node is computed
+            auto it = alloc_deps.find(graph->nodes[j]);
+            if (it != alloc_deps.end()) {
+                const std::vector<ggml_tensor *> & keep = it->second;
+                for (size_t k = 0; k < keep.size(); k += GGML_MAX_SRC) {
+                    struct ggml_tensor * dep = ggml_view_tensor(sched->ctx, keep[k]);
+                    for (size_t s = 0; s < GGML_MAX_SRC && k + s < keep.size(); s++) {
+                        dep->src[s] = keep[k + s];
+                    }
+                    assert(graph_copy->size > graph_copy->n_nodes);
+                    sched->node_backend_ids[graph_copy->n_nodes] = split->backend_id;
+                    graph_copy->nodes[graph_copy->n_nodes++] = dep;
+                    n_dep_nodes_added++;
+                }
+            }
         }
     }
+
+    // a mismatch means a backend added a dep with an `until` tensor that is not a node of the optimized graph
+    GGML_ASSERT(n_dep_nodes_added == n_dep_nodes);
 
     if (sched->n_copies > 1) {
         // add input copies as leafs so that they are allocated first
@@ -1893,6 +1952,68 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     }
 }
 
+static bool ggml_sched_rebind_event_trace_on(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char * e = getenv("GGML_SCHED_REBIND_EVENT_TRACE");
+        v = (e != NULL && atoi(e) != 0) ? 1 : 0;
+    }
+    return v == 1;
+}
+
+// A cached layout changes allocator-wide tensor addresses.  It is safe to
+// apply only after work from every copy slot has retired, not merely the slot
+// selected for the next graph.  Querying is non-blocking: a live event rejects
+// the fast rebind and lets the existing tier-3 drain/reserve path do the wait.
+static bool ggml_backend_sched_rebind_events_complete(ggml_backend_sched_t sched) {
+    const bool trace = ggml_sched_rebind_event_trace_on();
+    int main_recorded = 0;
+    int main_pending = 0;
+    int main_unqueryable = 0;
+    int staging_recorded = 0;
+    int staging_pending = 0;
+    int staging_unqueryable = 0;
+
+    for (int b = 0; b < sched->n_backends; ++b) {
+        const bool query_supported = sched->backends[b]->device != nullptr &&
+                sched->backends[b]->device->iface.event_query != nullptr;
+        for (int c = 0; c < sched->n_copies; ++c) {
+            if (sched->events_recorded[b][c]) {
+                ++main_recorded;
+                if (!query_supported || !ggml_backend_event_query(sched->events[b][c])) {
+                    ++main_pending;
+                    main_unqueryable += query_supported ? 0 : 1;
+                    if (!trace) {
+                        return false;
+                    }
+                }
+            }
+            if (sched->input_staging_events_recorded[b][c]) {
+                ++staging_recorded;
+                if (!query_supported || !ggml_backend_event_query(sched->input_staging_events[b][c])) {
+                    ++staging_pending;
+                    staging_unqueryable += query_supported ? 0 : 1;
+                    if (!trace) {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+
+    const bool complete = main_pending == 0 && staging_pending == 0;
+    if (trace) {
+        fprintf(stderr,
+                "REBIND-EVENT-SUMMARY sched=%p main_recorded=%d main_pending=%d main_unqueryable=%d "
+                "staging_recorded=%d staging_pending=%d staging_unqueryable=%d guard=%s\n",
+                (void *) sched, main_recorded, main_pending, main_unqueryable,
+                staging_recorded, staging_pending, staging_unqueryable,
+                complete ? "ALLOW_TIER2" : "FALLBACK_TIER3");
+    }
+
+    return complete;
+}
+
 static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     bool backend_ids_changed = false;
     for (int i = 0; i < sched->graph.n_nodes; i++) {
@@ -1917,11 +2038,13 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
         // The assignment changed or the active layout does not fit. Before
         // paying the reserve (which drains every backend and serializes any
         // cross-chunk pipeline overlap), try the allocation-layout cache with
-        // the current buffer-id assignment - a hit re-binds without a drain
-        // and is valid for any buffer count because only an exactly-matching
-        // assignment is adopted.
-        allocated = ggml_gallocr_alloc_graph_ids(sched->galloc, &sched->graph,
-                sched->node_backend_ids, sched->leaf_backend_ids);
+        // the current buffer-id assignment. A hit re-binds without a drain
+        // only when every copy-slot event has retired; otherwise tier 3 keeps
+        // the existing drain/reserve safety path.
+        if (ggml_backend_sched_rebind_events_complete(sched)) {
+            allocated = ggml_gallocr_alloc_graph_ids(sched->galloc, &sched->graph,
+                    sched->node_backend_ids, sched->leaf_backend_ids);
+        }
     }
     if (!allocated) {
 #ifndef NDEBUG
@@ -2298,6 +2421,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
             const int64_t t0 = ggml_backend_sched_timing_now(sched);
             ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
+            sched->events_recorded[split_backend_id][sched->cur_copy] = true;
             sched->timing.us_split_event_record += ggml_backend_sched_timing_dt(sched, t0);
         }
 
@@ -2587,6 +2711,23 @@ ggml_backend_t ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched,
 }
 
 // utils
+
+// [TAG_ALLOC_SIZE_EXPAND]
+// returns true for ops that may require additional memory for fleeting data on some backends,
+// i.e. the backend's get_alloc_size may return more than ggml_nbytes for the output tensor
+bool ggml_backend_op_alloc_size_may_expand(enum ggml_op op) {
+    switch (op) {
+        case GGML_OP_FLASH_ATTN_EXT:
+        case GGML_OP_MUL_MAT:
+        case GGML_OP_MUL_MAT_ID:
+        case GGML_OP_CUMSUM:
+        case GGML_OP_ARGSORT:
+        case GGML_OP_TOP_K:
+            return true;
+        default:
+            return false;
+    }
+}
 
 enum ggml_status ggml_backend_view_init(struct ggml_tensor * tensor) {
     GGML_ASSERT(tensor);
