@@ -1620,27 +1620,35 @@ std::string server_task_result_metrics::to_metrics() {
 // server_task_result_slot_save_load
 //
 json server_task_result_slot_save_load::to_json() {
+    json out;
     if (is_save) {
-        return json {
+        out = json {
             { "id_slot",   id_slot },
             { "filename",  filename },
             { "n_saved",   n_tokens },
             { "n_written", n_bytes },
+            { "n_checkpoints", n_checkpoints },
             { "timings", {
                 { "save_ms", t_ms }
             }},
         };
+    } else {
+        out = json {
+            { "id_slot",    id_slot },
+            { "filename",   filename },
+            { "n_restored", n_tokens },
+            { "n_read",     n_bytes },
+            { "n_checkpoints", n_checkpoints },
+            { "timings", {
+                { "restore_ms", t_ms }
+            }},
+        };
     }
-
-    return json {
-        { "id_slot",    id_slot },
-        { "filename",   filename },
-        { "n_restored", n_tokens },
-        { "n_read",     n_bytes },
-        { "timings", {
-            { "restore_ms", t_ms }
-        }},
-    };
+    // [SLOTCKPT] 快照旁 <file>.ckpt 的字节数 (0 = 老快照/无 checkpoint, 此时不输出该字段)
+    if (n_ckpt_bytes > 0) {
+        out["ckpt_bytes"] = n_ckpt_bytes;
+    }
+    return out;
 }
 
 //

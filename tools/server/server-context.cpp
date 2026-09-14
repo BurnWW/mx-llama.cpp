@@ -60,6 +60,117 @@ static bool server_memory_can_checkpoint(llama_context * ctx) {
     return mem && mem->get_can_checkpoint();
 }
 
+// [SLOTCKPT] context checkpoints 的磁盘 sidecar —— 这是 "恢复快照后仍全量重算" 的正解。
+//
+// 问题: /slots?action=save 原来只写 llama 状态 + token 列表 (见 SERVER_TASK_TYPE_SLOT_SAVE),
+// 而服务端的复用判定是
+//     pos_min >= pos_min_thold → 在 slot.prompt.checkpoints 里找合适的 checkpoint
+//                              → 找不到就 "forcing full prompt re-processing" 且 n_past = 0
+// (见 n_past/checkpoint 那段)。宿主内存缓存 (server_prompt_cache) 能复用是因为它的 load()
+// 末尾 prompt = std::move(it_best->prompt) 把 checkpoints 一起搬了; 磁盘这条路在 restore 里
+// slot->prompt.clear() 之后只填回 tokens, checkpoints 丢失 → 恢复出来的 KV 一次也用不上。
+// 实测: 21K token 的槽 save → restore 后同一请求 cache_n=0, 全量重算 81 秒; 而宿主内存
+// 那条路 cache_n=21004, 0.39 秒。本 sidecar 把 checkpoints (含投机状态) 一并落盘补齐。
+//
+// 格式 (版本化, 本机字节序): u32 magic, u32 version, u32 n;
+//   每条: i64 n_tokens, i32 id_task, i32 pos_min, i32 pos_max,
+//         u64 len + bytes (data_tgt), u64 len + bytes (data_dft), u64 len + bytes (data_spec)
+static const uint32_t SERVER_SLOT_CKPT_MAGIC   = 0x4B434C53; // "SLCK"
+static const uint32_t SERVER_SLOT_CKPT_VERSION = 1;
+
+static void server_write_u32(std::ostream & os, uint32_t v) { os.write(reinterpret_cast<const char *>(&v), sizeof(v)); }
+static void server_write_i32(std::ostream & os, int32_t  v) { os.write(reinterpret_cast<const char *>(&v), sizeof(v)); }
+static void server_write_i64(std::ostream & os, int64_t  v) { os.write(reinterpret_cast<const char *>(&v), sizeof(v)); }
+static void server_write_u64(std::ostream & os, uint64_t v) { os.write(reinterpret_cast<const char *>(&v), sizeof(v)); }
+
+static bool server_read_u32(std::istream & is, uint32_t & v) { is.read(reinterpret_cast<char *>(&v), sizeof(v)); return is.good(); }
+static bool server_read_i32(std::istream & is, int32_t  & v) { is.read(reinterpret_cast<char *>(&v), sizeof(v)); return is.good(); }
+static bool server_read_i64(std::istream & is, int64_t  & v) { is.read(reinterpret_cast<char *>(&v), sizeof(v)); return is.good(); }
+static bool server_read_u64(std::istream & is, uint64_t & v) { is.read(reinterpret_cast<char *>(&v), sizeof(v)); return is.good(); }
+
+static void server_write_blob(std::ostream & os, const std::vector<uint8_t> & blob) {
+    server_write_u64(os, (uint64_t) blob.size());
+    if (!blob.empty()) {
+        os.write(reinterpret_cast<const char *>(blob.data()), (std::streamsize) blob.size());
+    }
+}
+
+static bool server_read_blob(std::istream & is, std::vector<uint8_t> & blob) {
+    uint64_t n = 0;
+    if (!server_read_u64(is, n)) {
+        return false;
+    }
+    blob.resize((size_t) n);
+    if (n > 0) {
+        is.read(reinterpret_cast<char *>(blob.data()), (std::streamsize) n);
+        if (!is.good()) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// 写 <快照文件>.ckpt; 返回写入字节数 (0 = 无 checkpoint 或失败)。
+static size_t server_slot_ckpt_save(const std::string & path, const std::list<common_prompt_checkpoint> & ckpts) {
+    if (ckpts.empty()) {
+        return 0;
+    }
+    std::ofstream os(path, std::ios::binary | std::ios::trunc);
+    if (!os) {
+        return 0;
+    }
+    server_write_u32(os, SERVER_SLOT_CKPT_MAGIC);
+    server_write_u32(os, SERVER_SLOT_CKPT_VERSION);
+    server_write_u32(os, (uint32_t) ckpts.size());
+    for (const auto & c : ckpts) {
+        server_write_i64(os, c.n_tokens);
+        server_write_i32(os, (int32_t) c.id_task);
+        server_write_i32(os, (int32_t) c.pos_min);
+        server_write_i32(os, (int32_t) c.pos_max);
+        server_write_blob(os, c.data_tgt);
+        server_write_blob(os, c.data_dft);
+        server_write_blob(os, c.data_spec);
+    }
+    os.flush();
+    return os.good() ? (size_t) os.tellp() : 0;
+}
+
+// 读 <快照文件>.ckpt 并**追加**到 ckpts; 返回读到的条数 (0 = 无该文件/格式不符)。
+static size_t server_slot_ckpt_load(const std::string & path, std::list<common_prompt_checkpoint> & ckpts) {
+    std::ifstream is(path, std::ios::binary);
+    if (!is) {
+        return 0; // 新格式才有 sidecar; 老快照静默按原行为处理
+    }
+    uint32_t magic = 0, version = 0, n = 0;
+    if (!server_read_u32(is, magic) || !server_read_u32(is, version) || !server_read_u32(is, n)) {
+        return 0;
+    }
+    if (magic != SERVER_SLOT_CKPT_MAGIC || version != SERVER_SLOT_CKPT_VERSION) {
+        LOG_WRN("%s: bad checkpoint sidecar '%s' (magic=%08x version=%u), ignoring\n", __func__, path.c_str(), magic, version);
+        return 0;
+    }
+    size_t loaded = 0;
+    for (uint32_t i = 0; i < n; ++i) {
+        common_prompt_checkpoint c;
+        int64_t n_tokens = 0;
+        int32_t id_task = -1, pos_min = 0, pos_max = 0;
+        if (!server_read_i64(is, n_tokens) || !server_read_i32(is, id_task) ||
+                !server_read_i32(is, pos_min) || !server_read_i32(is, pos_max)) {
+            break;
+        }
+        if (!server_read_blob(is, c.data_tgt) || !server_read_blob(is, c.data_dft) || !server_read_blob(is, c.data_spec)) {
+            break;
+        }
+        c.n_tokens = n_tokens;
+        c.id_task  = id_task;
+        c.pos_min  = pos_min;
+        c.pos_max  = pos_max;
+        ckpts.push_back(std::move(c));
+        ++loaded;
+    }
+    return loaded;
+}
+
 // synthetic draft verification for benchmarking - accept draft tokens at random instead of by match with the target
 // on replay the draft was already accepted before a context checkpoint restore, so repeat the same decisions
 static std::vector<llama_token> server_sample_and_accept_synth(
@@ -2585,6 +2696,30 @@ private:
                         break;
                     }
 
+                    // [SLOTCKPT] 快照必须带上 context checkpoints, 否则恢复后服务端判 "cache 数据缺失"
+                    // 并强制全量重算 (详见 server_slot_ckpt_save 上方说明)。草稿上下文的完整状态同理
+                    // 一起存 (宿主内存那条路也是 main + drft 一起存的), 避免恢复后草稿从冷 KV 开始。
+                    // 空槽不写 sidecar, 免得留下对不上的陈旧文件。
+                    size_t n_ckpt = 0;
+                    if (slot->prompt.tokens.size() > 0) {
+                        n_ckpt = server_slot_ckpt_save(filepath + ".ckpt", slot->prompt.checkpoints);
+                        if (n_ckpt == 0) {
+                            std::error_code ec;
+                            std::filesystem::remove(filepath + ".ckpt", ec);
+                        }
+                        if (ctx_dft != nullptr) {
+                            const size_t n_dft = llama_state_seq_save_file(
+                                ctx_dft, (filepath + ".draft").c_str(), slot->id,
+                                reinterpret_cast<const llama_token *>(packed.data()), packed.size() / sizeof(llama_token));
+                            if (n_dft == 0) {
+                                SRV_WRN("failed to save draft context state to %s.draft\n", filepath.c_str());
+                            }
+                        }
+                        SRV_DBG("saved slot %d sidecars: %d context checkpoints (%zu bytes), draft state %s\n",
+                                id_slot, (int) slot->prompt.checkpoints.size(), n_ckpt,
+                                ctx_dft != nullptr ? "saved" : "n/a");
+                    }
+
                     const int64_t t_end = ggml_time_us();
                     const double t_save_ms = (t_end - t_start) / 1000.0;
 
@@ -2596,6 +2731,8 @@ private:
                     res->n_tokens = slot->prompt.tokens.size();
                     res->n_bytes  = nwrite;
                     res->t_ms     = t_save_ms;
+                    res->n_checkpoints = slot->prompt.checkpoints.size();
+                    res->n_ckpt_bytes  = n_ckpt;
                     queue_results.send(std::move(res));
                 } break;
             case SERVER_TASK_TYPE_SLOT_RESTORE:
@@ -2619,6 +2756,7 @@ private:
                     std::string filepath = task.slot_action.filepath;
 
                     size_t nread = 0;
+                    size_t n_ckpt = 0;
                     try {
                         size_t n_packed = 0;
                         llama_tokens packed;
@@ -2644,6 +2782,25 @@ private:
 
                         slot->prompt.clear();
                         slot->prompt.tokens = std::move(restored);
+
+                        // [SLOTCKPT] 读回 context checkpoints / 草稿状态 —— 少了这一步, 服务端复用判定
+                        // 会因找不到 checkpoint 而强制全量重算 (见 server_slot_ckpt_save 上方说明)。
+                        // 老快照没有这两个 sidecar 时静默跳过, 行为与打补丁前一致。
+                        n_ckpt = server_slot_ckpt_load(filepath + ".ckpt", slot->prompt.checkpoints);
+                        if (ctx_dft != nullptr) {
+                            size_t n_packed_dft = 0;
+                            llama_tokens packed_dft;
+                            size_t n_dft = llama_state_seq_load_file(ctx_dft, (filepath + ".draft").c_str(), slot->id, nullptr, 0, &n_packed_dft);
+                            if (n_dft != 0) {
+                                packed_dft.resize(std::max<size_t>(1, n_packed_dft));
+                                n_dft = llama_state_seq_load_file(ctx_dft, (filepath + ".draft").c_str(), slot->id, packed_dft.data(), packed_dft.size(), &n_packed_dft);
+                            }
+                            if (n_dft == 0) {
+                                SRV_DBG("no draft context sidecar for %s (老快照或未存草稿)\n", filepath.c_str());
+                            }
+                        }
+                        SRV_DBG("restored slot %d: %zu tokens, %zu context checkpoints\n",
+                                id_slot, slot->prompt.tokens.size(), n_ckpt);
                     } catch (const std::exception & err) {
                         slot->prompt_clear();
                         send_error(task, std::string("Unable to restore slot: ") + err.what(), ERROR_TYPE_INVALID_REQUEST);
@@ -2661,6 +2818,7 @@ private:
                     res->n_tokens = slot->prompt.tokens.size();
                     res->n_bytes  = nread;
                     res->t_ms     = t_restore_ms;
+                    res->n_checkpoints = slot->prompt.checkpoints.size();
                     queue_results.send(std::move(res));
                 } break;
             case SERVER_TASK_TYPE_SLOT_ERASE:

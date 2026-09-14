@@ -526,6 +526,11 @@ struct server_task_result_slot_save_load : server_task_result {
     size_t n_bytes;
     double t_ms;
 
+    // [SLOTCKPT] 随快照写入/读回的 context checkpoint 数 (sidecar <file>.ckpt) 与其字节数;
+    // n_checkpoints = 0 表示老快照 (没有 sidecar) 或该槽当时没有 checkpoint。
+    size_t n_checkpoints = 0;
+    size_t n_ckpt_bytes  = 0;
+
     virtual json to_json() override;
 };
 
