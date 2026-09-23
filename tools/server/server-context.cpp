@@ -2732,7 +2732,6 @@ private:
                     res->n_bytes  = nwrite;
                     res->t_ms     = t_save_ms;
                     res->n_checkpoints = slot->prompt.checkpoints.size();
-                    res->n_ckpt_bytes  = n_ckpt;
                     queue_results.send(std::move(res));
                 } break;
             case SERVER_TASK_TYPE_SLOT_RESTORE:

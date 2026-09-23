@@ -10,7 +10,16 @@
 #include "speculative.h"
 #include "server-common.h"
 
+#include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <mutex>
 #include <sstream>
+#include <thread>
 
 //
 // task_params
@@ -1644,10 +1653,6 @@ json server_task_result_slot_save_load::to_json() {
             }},
         };
     }
-    // [SLOTCKPT] 快照旁 <file>.ckpt 的字节数 (0 = 老快照/无 checkpoint, 此时不输出该字段)
-    if (n_ckpt_bytes > 0) {
-        out["ckpt_bytes"] = n_ckpt_bytes;
-    }
     return out;
 }
 
@@ -1870,6 +1875,9 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         prompt = std::move(it_best->prompt);
 
         states.erase(it_best);
+    } else {
+        // L3 磁盘层(冷缓存): RAM 没命中 → 按 token 前缀从磁盘召回, 判据与上面完全一致
+        disk_load(prompt, tokens_new, ctx_tgt, ctx_dft, id_slot, f_keep_best, f_sim_best);
     }
 
     return true;
@@ -1878,8 +1886,10 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 void server_prompt_cache::update() {
     if (limit_size > 0) {
         while (!states.empty() && size() > limit_size) {
-            SRV_WRN(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", states.front().size() / (1024.0 * 1024.0));
+            SRV_WRN(" - cache size limit reached, pushing oldest entry to disk (size = %.3f MiB)\n", states.front().size() / (1024.0 * 1024.0));
 
+            // L3: 磁盘层开着就溢写到磁盘(后台线程), 关着则退回旧行为(直接丢)
+            disk_write(std::move(states.front()));
             states.pop_front();
         }
     }
@@ -1892,9 +1902,11 @@ void server_prompt_cache::update() {
 
     if (limit_tokens > 0) {
         while (!states.empty() && n_tokens() > limit_tokens_cur) {
-            SRV_WRN(" - cache token limit (%zu, est: %zu) reached, removing oldest entry (size = %.3f MiB)\n",
+            SRV_WRN(" - cache token limit (%zu, est: %zu) reached, pushing oldest entry to disk (size = %.3f MiB)\n",
                     limit_tokens, limit_tokens_cur, states.front().size() / (1024.0 * 1024.0));
 
+            // L3: 同上, 溢写到磁盘而不是丢弃
+            disk_write(std::move(states.front()));
             states.pop_front();
         }
     }
@@ -1906,4 +1918,436 @@ void server_prompt_cache::update() {
         SRV_TRC("   - prompt %p: %7d tokens, checkpoints: %2zu, %9.3f MiB\n",
                 (const void *)&state, state.prompt.n_tokens(), state.prompt.checkpoints.size(), state.size() / (1024.0 * 1024.0));
     }
+}
+
+//
+// server_prompt_cache :: L3 磁盘层 (冷缓存)
+//
+// 与 RAM 层存的是同一份东西: tokens + context checkpoints + KV 字节 (data.main/drft)。
+// 唯一的差别是位置 —— 内存装不下时溢写到磁盘, 召回时读回来, 走的还是同一套
+// llama_state_seq_set_data_ext 注入路径。寻址按 token 前缀 (不用会话指纹)。
+//
+namespace {
+
+constexpr uint32_t KVCD_MAGIC   = 0x4b564344; // 'C''D''V''K' (固定即可, 只求自洽)
+constexpr uint32_t KVCD_VERSION = 1;
+
+template<typename T>
+void kvcd_w(std::ostream & os, const T & v) {
+    os.write(reinterpret_cast<const char *>(&v), sizeof(T));
+}
+
+template<typename T>
+bool kvcd_r(std::istream & is, T & v) {
+    is.read(reinterpret_cast<char *>(&v), sizeof(T));
+    return (bool) is;
+}
+
+void kvcd_wbuf(std::ostream & os, const std::vector<uint8_t> & b) {
+    kvcd_w(os, (uint32_t) b.size());
+    if (!b.empty()) {
+        os.write(reinterpret_cast<const char *>(b.data()), b.size());
+    }
+}
+
+bool kvcd_rbuf(std::istream & is, std::vector<uint8_t> & b) {
+    uint32_t n = 0;
+    if (!kvcd_r(is, n)) {
+        return false;
+    }
+    b.resize(n);
+    if (n > 0) {
+        is.read(reinterpret_cast<char *>(b.data()), n);
+        if (!is) {
+            return false;
+        }
+    }
+    return true;
+}
+
+uint64_t kvcd_fnv1a(const void * data, size_t size) {
+    uint64_t h = 1469598103934665603ull;
+    const uint8_t * p = (const uint8_t *) data;
+    for (size_t i = 0; i < size; ++i) {
+        h ^= p[i];
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+
+// 读一个磁盘条目。head_only = true 时只读 tokens (扫描索引/前缀匹配用), 不读 KV 大块。
+bool kvcd_read_entry(const std::string & path, bool head_only, server_tokens & tokens, server_prompt_cache_state * st) {
+    std::ifstream is(path, std::ios::binary);
+    if (!is) {
+        return false;
+    }
+
+    uint32_t magic = 0, version = 0, has_mtmd = 0, len = 0;
+    if (!kvcd_r(is, magic) || !kvcd_r(is, version) || !kvcd_r(is, has_mtmd) || !kvcd_r(is, len)) {
+        return false;
+    }
+    if (magic != KVCD_MAGIC || version != KVCD_VERSION) {
+        return false;
+    }
+
+    std::vector<char> packed(len);
+    if (len > 0) {
+        is.read(packed.data(), len);
+        if (!is) {
+            return false;
+        }
+    }
+
+    GGML_ASSERT(packed.size() % sizeof(llama_token) == 0);
+    llama_tokens packed_tok(packed.size() / sizeof(llama_token));
+    if (!packed.empty()) {
+        memcpy(packed_tok.data(), packed.data(), packed.size());
+    }
+
+    try {
+        tokens = server_tokens::deserialize(packed_tok, has_mtmd != 0);
+    } catch (const std::exception & err) {
+        SRV_WRN("%s: deserialize failed for '%s': %s\n", __func__, path.c_str(), err.what());
+        return false;
+    }
+
+    if (head_only) {
+        return true;
+    }
+
+    uint32_t n_ckpt = 0;
+    if (!kvcd_r(is, n_ckpt)) {
+        return false;
+    }
+    for (uint32_t i = 0; i < n_ckpt; ++i) {
+        int64_t n_tokens = 0;
+        int32_t id_task = 0, pos_min = 0, pos_max = 0;
+        if (!kvcd_r(is, n_tokens) || !kvcd_r(is, id_task) || !kvcd_r(is, pos_min) || !kvcd_r(is, pos_max)) {
+            return false;
+        }
+        common_prompt_checkpoint c;
+        c.n_tokens = n_tokens;
+        c.id_task  = id_task;
+        c.pos_min  = pos_min;
+        c.pos_max  = pos_max;
+        if (!kvcd_rbuf(is, c.data_tgt) || !kvcd_rbuf(is, c.data_dft) || !kvcd_rbuf(is, c.data_spec)) {
+            return false;
+        }
+        st->prompt.checkpoints.push_back(std::move(c));
+    }
+
+    if (!kvcd_rbuf(is, st->data.main) || !kvcd_rbuf(is, st->data.drft)) {
+        return false;
+    }
+    st->prompt.tokens = std::move(tokens);
+
+    return true;
+}
+
+} // namespace
+
+void server_prompt_cache::disk_init_from_env() {
+    const char * dir = getenv("LLAMA_CACHE_DISK_DIR");
+    if (dir == nullptr || dir[0] == '\0') {
+        return; // 默认关闭: 行为与打补丁前**完全一致**
+    }
+
+    disk_dir = dir;
+
+    const char * mib = getenv("LLAMA_CACHE_DISK_MIB");
+    if (mib != nullptr && mib[0] != '\0') {
+        const long long v = atoll(mib);
+        limit_disk_size = v > 0 ? (size_t) v * 1024ull * 1024ull : 0;
+    }
+
+    SRV_TRC("%s: L3 disk cache: dir = %s, limit = %.3f MiB\n", __func__, disk_dir.c_str(),
+            limit_disk_size / (1024.0 * 1024.0));
+}
+
+// 调用方必须持有 disk_mu。
+void server_prompt_cache::disk_scan() {
+    if (disk_scanned) {
+        return;
+    }
+    disk_scanned = true;
+
+    if (disk_dir.empty()) {
+        return;
+    }
+
+    std::error_code ec;
+    if (!std::filesystem::exists(disk_dir, ec)) {
+        std::filesystem::create_directories(disk_dir, ec);
+        if (ec) {
+            SRV_WRN("%s: cannot create disk cache dir '%s': %s\n", __func__, disk_dir.c_str(), ec.message().c_str());
+            disk_dir.clear(); // 关掉磁盘层, 别每轮都失败一次
+        }
+        return;
+    }
+
+    for (const auto & de : std::filesystem::directory_iterator(disk_dir, ec)) {
+        if (ec) {
+            break;
+        }
+        if (!de.is_regular_file()) {
+            continue;
+        }
+
+        const std::string name = de.path().filename().string();
+        if (name.size() < 4 || name.compare(name.size() - 3, 3, ".kv") != 0) {
+            continue;
+        }
+
+        disk_entry e;
+        e.path = de.path().string();
+        {
+            std::error_code ec2;
+            e.bytes = (size_t) de.file_size(ec2);
+            const auto ft = de.last_write_time(ec2);
+            e.mtime_us = (int64_t) std::chrono::duration_cast<std::chrono::microseconds>(ft.time_since_epoch()).count();
+        }
+
+        // 只读头部拿 tokens (够前缀匹配), 不读 KV 大块
+        server_tokens toks;
+        if (!kvcd_read_entry(e.path, /*head_only =*/ true, toks, nullptr)) {
+            SRV_WRN("%s: dropping unreadable disk cache entry '%s'\n", __func__, name.c_str());
+            std::error_code ec3;
+            std::filesystem::remove(e.path, ec3);
+            continue;
+        }
+        e.tokens = std::move(toks);
+
+        disk_size += e.bytes;
+        disk_index.push_back(std::move(e));
+    }
+
+    SRV_TRC("%s: scanned %zu disk cache entries, %.3f MiB\n", __func__, disk_index.size(), disk_size / (1024.0 * 1024.0));
+
+    disk_evict_to_budget();
+}
+
+// 调用方必须持有 disk_mu。
+void server_prompt_cache::disk_evict_to_budget() {
+    if (limit_disk_size == 0) {
+        return;
+    }
+
+    while (disk_size > limit_disk_size && !disk_index.empty()) {
+        size_t idx = 0;
+        for (size_t i = 1; i < disk_index.size(); ++i) {
+            if (disk_index[i].mtime_us < disk_index[idx].mtime_us) {
+                idx = i;
+            }
+        }
+
+        SRV_WRN(" - disk cache limit reached, removing oldest entry '%s' (%.3f MiB)\n",
+                disk_index[idx].path.c_str(), disk_index[idx].bytes / (1024.0 * 1024.0));
+
+        std::error_code ec;
+        std::filesystem::remove(disk_index[idx].path, ec);
+        disk_size -= std::min(disk_size, disk_index[idx].bytes);
+        disk_index.erase(disk_index.begin() + idx);
+    }
+}
+
+bool server_prompt_cache::disk_write(server_prompt_cache_state st) {
+    if (disk_dir.empty()) {
+        return false;
+    }
+
+    // 文件名 = tokens 的 FNV-1a (同一段 token 序列 → 同一个文件)。
+    // 注意: 多模态 prompt 的 serialize() 会抛异常 —— 那就跳过 (文本模型不受影响)。
+    std::vector<char> packed;
+    try {
+        packed = st.prompt.tokens.serialize();
+    } catch (const std::exception & err) {
+        SRV_WRN("%s: skipping disk spill (cannot serialize tokens: %s)\n", __func__, err.what());
+        return false;
+    }
+
+    char hex[32];
+    snprintf(hex, sizeof(hex), "%016llx", (unsigned long long) kvcd_fnv1a(packed.data(), packed.size()));
+    const std::string path = disk_dir + "/" + hex + ".kv";
+
+    const size_t bytes = st.size() + packed.size() + 64;
+
+    {
+        std::lock_guard<std::mutex> lk(disk_mu);
+        disk_scan(); // 惰性扫描 (幂等)
+
+        for (const auto & e : disk_index) {
+            if (e.path == path) {
+                return true; // 同一份已在盘上
+            }
+        }
+
+        disk_entry e;
+        e.path     = path;
+        e.tokens   = st.prompt.tokens.clone();
+        e.bytes    = bytes;
+        e.mtime_us = ggml_time_us();
+
+        disk_size += bytes;
+        disk_index.push_back(std::move(e));
+
+        disk_evict_to_budget();
+    }
+
+    // GB 级 IO 放后台线程 —— update() 在请求热路径上, 不能让它等盘。
+    // 这份 state 已经从 states 里移出来了, 没有别人碰它, 所以可以安全地 move 进线程。
+    std::thread([this, st = std::move(st), path, packed = std::move(packed)]() mutable {
+        std::error_code ec;
+        const std::string tmp = path + ".tmp";
+        {
+            std::ofstream os(tmp, std::ios::binary | std::ios::trunc);
+            if (!os) {
+                return;
+            }
+
+            kvcd_w(os, KVCD_MAGIC);
+            kvcd_w(os, KVCD_VERSION);
+            kvcd_w(os, (uint32_t) st.prompt.tokens.has_mtmd);
+            kvcd_w(os, (uint32_t) packed.size());
+            if (!packed.empty()) {
+                os.write(packed.data(), packed.size());
+            }
+
+            kvcd_w(os, (uint32_t) st.prompt.checkpoints.size());
+            for (const auto & c : st.prompt.checkpoints) {
+                kvcd_w(os, (int64_t) c.n_tokens);
+                kvcd_w(os, (int32_t) c.id_task);
+                kvcd_w(os, (int32_t) c.pos_min);
+                kvcd_w(os, (int32_t) c.pos_max);
+                kvcd_wbuf(os, c.data_tgt);
+                kvcd_wbuf(os, c.data_dft);
+                kvcd_wbuf(os, c.data_spec);
+            }
+
+            kvcd_wbuf(os, st.data.main);
+            kvcd_wbuf(os, st.data.drft);
+
+            os.flush();
+            if (!os) {
+                std::filesystem::remove(tmp, ec);
+                return;
+            }
+        }
+
+        std::filesystem::rename(tmp, path, ec);
+        if (ec) {
+            SRV_WRN("%s: rename '%s' failed: %s\n", __func__, path.c_str(), ec.message().c_str());
+            std::filesystem::remove(tmp, ec);
+            return;
+        }
+
+        std::lock_guard<std::mutex> lk(disk_mu);
+        for (auto & e : disk_index) {
+            if (e.path == path) {
+                e.mtime_us = ggml_time_us();
+                break;
+            }
+        }
+    }).detach();
+
+    return true;
+}
+
+bool server_prompt_cache::disk_read(const std::string & path, server_prompt_cache_state & out) {
+    server_tokens toks;
+    if (!kvcd_read_entry(path, /*head_only =*/ false, toks, &out)) {
+        return false;
+    }
+    return true;
+}
+
+bool server_prompt_cache::disk_load(server_prompt & prompt, const server_tokens & tokens_new,
+        llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot,
+        float f_keep_best, float f_sim_best) {
+    if (disk_dir.empty()) {
+        return false;
+    }
+
+    // 1) 按 token 前缀挑最匹配的条目 (与 RAM 路径同一套 f_keep/f_sim 判据, 同一套基准)
+    std::string best;
+    {
+        std::lock_guard<std::mutex> lk(disk_mu);
+        disk_scan();
+
+        for (const auto & e : disk_index) {
+            if (e.tokens.empty() || tokens_new.empty()) {
+                continue;
+            }
+
+            const int lcp = (int) e.tokens.get_common_prefix(tokens_new);
+
+            const float f_keep_cur = float(lcp) / e.tokens.size();
+            const float f_sim_cur  = float(lcp) / tokens_new.size();
+
+            // don't trash large prompts (与 load() 里一致)
+            if (f_keep_cur < 0.25f) {
+                continue;
+            }
+
+            if (f_keep_best < f_keep_cur && f_sim_best < f_sim_cur) {
+                f_keep_best = f_keep_cur;
+                f_sim_best  = f_sim_cur;
+                best        = e.path;
+            }
+        }
+    }
+
+    if (best.empty()) {
+        return false; // 冷缓存里也没有更合适的
+    }
+
+    // 2) 读回来 (GB 级, 秒级 —— 冷召回本来就要付这个代价)
+    server_prompt_cache_state st;
+    if (!disk_read(best, st)) {
+        SRV_WRN("%s: failed to read disk cache entry '%s'\n", __func__, best.c_str());
+        return false;
+    }
+
+    SRV_TRC(" - loading prompt from disk cache: %d tokens, %zu checkpoints, %.3f MiB\n",
+            st.prompt.n_tokens(), st.prompt.checkpoints.size(), st.data.size() / (1024.0 * 1024.0));
+
+    // 3) 注入槽 —— 与 RAM 路径**完全相同**的两步: set_data_ext 灌 KV, 再把
+    //    tokens + checkpoints 一起 move 给 prompt (checkpoints 是复用判定的关键)。
+    {
+        const size_t size = st.data.main.size();
+        const size_t n = llama_state_seq_set_data_ext(ctx_tgt, st.data.main.data(), size, id_slot, 0);
+        if (n != size) {
+            SRV_ERR("%s: failed to restore disk state with size %zu\n", __func__, size);
+            return false;
+        }
+    }
+
+    if (!st.data.drft.empty()) {
+        if (ctx_dft == nullptr) {
+            SRV_WRN("%s: disk state has draft data but no draft context\n", __func__);
+            return false;
+        }
+        const size_t size = st.data.drft.size();
+        const size_t n = llama_state_seq_set_data_ext(ctx_dft, st.data.drft.data(), size, id_slot, 0);
+        if (n != size) {
+            SRV_WRN("%s: failed to restore disk draft state with size %zu\n", __func__, size);
+            return false;
+        }
+    }
+
+    prompt = std::move(st.prompt);
+
+    // 刚用过: 刷新 mtime, 让它别被 disk_evict_to_budget 当最旧的清掉
+    {
+        std::error_code ec;
+        std::filesystem::last_write_time(best, std::filesystem::file_time_type::clock::now(), ec);
+        std::lock_guard<std::mutex> lk(disk_mu);
+        for (auto & e : disk_index) {
+            if (e.path == best) {
+                e.mtime_us = ggml_time_us();
+                break;
+            }
+        }
+    }
+
+    return true;
 }

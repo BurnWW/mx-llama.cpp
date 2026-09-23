@@ -7,6 +7,8 @@
 #include <unordered_set>
 #include <list>
 #include <map>
+#include <mutex>
+#include <vector>
 
 // TODO: prevent including the whole server-common.h as we only use server_tokens
 #include "server-common.h"
@@ -526,10 +528,9 @@ struct server_task_result_slot_save_load : server_task_result {
     size_t n_bytes;
     double t_ms;
 
-    // [SLOTCKPT] 随快照写入/读回的 context checkpoint 数 (sidecar <file>.ckpt) 与其字节数;
+    // [SLOTCKPT] 随快照写入/读回的 context checkpoint 数 (sidecar <file>.ckpt);
     // n_checkpoints = 0 表示老快照 (没有 sidecar) 或该槽当时没有 checkpoint。
     size_t n_checkpoints = 0;
-    size_t n_ckpt_bytes  = 0;
 
     virtual json to_json() override;
 };
@@ -618,6 +619,9 @@ struct server_prompt_cache {
     server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens) {
         this->limit_size   = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
         this->limit_tokens = limit_tokens;
+
+        // L3 磁盘层(冷缓存): 默认关闭, 由 LLAMA_CACHE_DISK_DIR 开启
+        disk_init_from_env();
     }
 
     std::list<server_prompt_cache_state> states;
@@ -637,6 +641,56 @@ struct server_prompt_cache {
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
 
     void update();
+
+    // ========================================================================
+    // L3 磁盘层 (冷缓存) —— 「KV 无损地存到磁盘, 会话回来时按 token 前缀召回」
+    // ========================================================================
+    //
+    // 为什么放在这里: RAM 层 (上面的 states) 已经是无损的 —— 存的是整份 KV 字节
+    // (data.main/drft) + tokens + context checkpoints, load() 时整体搬回槽里。
+    // 它唯一的问题就是**内存装不下**: update()/alloc() 超限时直接 pop_front() 丢掉了。
+    // 这里把「丢掉」改成「溢写到磁盘」, 召回时再读回来 —— 就是同一份数据的换层。
+    //
+    // 寻址用 token 前缀 (server_tokens::get_common_prefix), 不用会话指纹 ——
+    // KV cells 天生就是「某段 token 序列」的函数, 前缀一致就一定可复用。
+    //
+    // 开关 (env, 与 config.json 的 env 块对接; 不设 = 关闭, 行为与打补丁前完全一致):
+    //   LLAMA_CACHE_DISK_DIR  存盘目录 (空 = 关闭)。建议指向大盘, 如 /cache/kv
+    //   LLAMA_CACHE_DISK_MIB  磁盘预算 (MiB; 0/不设 = 不限), 超了按 mtime 淘汰最旧
+    //
+    // 文件: <dir>/<fnv1a64(tokens)>.kv, 单个文件自带 tokens + checkpoints + KV 字节
+    // (版本化 magic/version, 格式不符直接忽略)。
+    struct disk_entry {
+        std::string   path;
+        server_tokens tokens;
+        size_t        bytes    = 0;
+        int64_t       mtime_us = 0;
+    };
+
+    std::string disk_dir;
+    size_t      limit_disk_size = 0; // 字节, 0 = 不限
+    size_t      disk_size       = 0; // 当前占用 (字节)
+    bool        disk_scanned    = false;
+    std::mutex  disk_mu;             // 保护 disk_index / disk_size / disk_scanned
+    std::vector<disk_entry> disk_index;
+
+    void disk_init_from_env();
+    void disk_scan();
+
+    // 把一份 state 落到磁盘 (返回是否写成功)。调用方可以 move 进来, 写盘在后台线程做。
+    bool disk_write(server_prompt_cache_state st);
+
+    // 读回一份 state (含 tokens / checkpoints / KV 字节)。
+    bool disk_read(const std::string & path, server_prompt_cache_state & out);
+
+    // 按 LLAMA_CACHE_DISK_MIB 淘汰最旧的文件。
+    void disk_evict_to_budget();
+
+    // 磁盘召回: 在前缀最匹配的条目上做与 RAM 路径**完全相同**的注入 (set_data_ext + move
+    // prompt)。命中返回 true。f_keep_best/f_sim_best 是 RAM 路径留下的基准。
+    bool disk_load(server_prompt & prompt, const server_tokens & tokens_new,
+                   llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot,
+                   float f_keep_best, float f_sim_best);
 };
 
 // used exclusively by router mode
