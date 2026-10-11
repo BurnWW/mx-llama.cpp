@@ -1902,6 +1902,10 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                             split->inputs[n_inputs] = root;
                         }
                         for (int c = 0; c < sched->n_copies; c++) {
+                            // The root copy now has a second reader that ggml-alloc cannot see: a view that is a leaf is not counted as a use.
+                            // Without the output flag the root's last direct reader may be written in place over it, or the block freed, while the view is still read.
+                            // The copy may predate this branch (a node that reads the root directly came first), so it is flagged here and not only where it is created.
+                            ggml_set_output(tensor_id_copy(root_id, cur_backend_id, c));
                             struct ggml_tensor * tensor_copy = ggml_view_4d(sched->ctx, tensor_id_copy(root_id, cur_backend_id, c),
                                 src->ne[0], src->ne[1], src->ne[2], src->ne[3], src->nb[1], src->nb[2], src->nb[3], 0);
                             ggml_format_name(tensor_copy, "%s#%s#%d", ggml_backend_name(backend), src->name, c);
