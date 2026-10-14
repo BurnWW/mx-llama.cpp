@@ -480,6 +480,8 @@ static ggml_backend_buffer_type_t ggml_backend_meta_buft_simple_buft(ggml_backen
 
 static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size);
 
+static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer_n(ggml_backend_buffer_type_t buft, ggml_tensor ** tensors, int n_tensors);
+
 static size_t ggml_backend_meta_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
     const size_t n_simple_bufts = ggml_backend_meta_buft_n_bufts(buft);
     size_t max_alignment = 1;
@@ -521,12 +523,14 @@ static bool ggml_backend_meta_buffer_type_is_host(ggml_backend_buffer_type_t buf
 }
 
 static const struct ggml_backend_buffer_type_i ggml_backend_meta_buffer_type_iface = {
-    /* .get_name         = */ ggml_backend_meta_buffer_type_get_name,
-    /* .alloc_buffer     = */ ggml_backend_meta_buffer_type_alloc_buffer,
-    /* .get_alignment    = */ ggml_backend_meta_buffer_type_get_alignment,
-    /* .get_max_size     = */ ggml_backend_meta_buffer_type_get_max_size,
-    /* .get_alloc_size   = */ ggml_backend_meta_buffer_type_get_alloc_size,
-    /* .is_host          = */ ggml_backend_meta_buffer_type_is_host,
+    /* .get_name            = */ ggml_backend_meta_buffer_type_get_name,
+    /* .alloc_buffer        = */ ggml_backend_meta_buffer_type_alloc_buffer,
+    /* .alloc_buffer_n      = */ ggml_backend_meta_buffer_type_alloc_buffer_n,
+    /* .get_alignment       = */ ggml_backend_meta_buffer_type_get_alignment,
+    /* .get_max_size        = */ ggml_backend_meta_buffer_type_get_max_size,
+    /* .get_alloc_size      = */ ggml_backend_meta_buffer_type_get_alloc_size,
+    /* .get_alloc_size_n    = */ NULL,
+    /* .is_host             = */ ggml_backend_meta_buffer_type_is_host,
 };
 
 bool ggml_backend_buft_is_meta(ggml_backend_buffer_type_t buft) {
@@ -1251,7 +1255,12 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         ggml_backend_meta_split_state split_state;
         switch (tensor->op) {
             case GGML_OP_NONE: {
-                split_state = {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+                if (tensor->view_src != nullptr) {
+                    // full-tensor view created with ggml_view_tensor, transparent for the split state
+                    split_state = ggml_backend_meta_get_split_state(stc, tensor->view_src, assume_sync);
+                } else {
+                    split_state = {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+                }
             } break;
             case GGML_OP_DUP: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
@@ -1591,15 +1600,28 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     return ret;
 }
 
+static bool ggml_backend_meta_is_host_view(const struct ggml_tensor * tensor) {
+    return ggml_is_view(tensor) && ggml_backend_buffer_is_host(tensor->view_src->buffer);
+}
+
 static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(const struct ggml_tensor * tensor, bool assume_sync) {
+    // [TAG_META_HOST_VIEWS]
+    // TODO: technically, this check should not be needed if the backend scheduler correctly prevents assigning
+    //       such host-buffer views to the meta backend. figure out how to update the scheduler logic to achieve that
+    //       ref: https://github.com/ggml-org/llama.cpp/pull/30217
     if (tensor->buffer == nullptr || !ggml_backend_buffer_is_meta(tensor->buffer)) {
-        // name the tensor rather than aborting on a bare line number - this fires under
-        // -tps when a node ends up outside the meta buffer
-        GGML_LOG_ERROR("%s: tensor '%s' (op %s) is not in a meta buffer, it is in '%s'\n",
-                __func__, tensor->name, ggml_op_name(tensor->op),
-                tensor->buffer ? ggml_backend_buffer_name(tensor->buffer) : "(null)");
+        if (!ggml_backend_meta_is_host_view(tensor)) {
+            // name the tensor rather than aborting on a bare line number, this fires under -tps when a node ends up outside the meta buffer
+            GGML_LOG_ERROR("%s: tensor '%s' (op %s) is not in a meta buffer, it is in '%s'%c",
+                    __func__, tensor->name, ggml_op_name(tensor->op),
+                    tensor->buffer ? ggml_backend_buffer_name(tensor->buffer) : "(null)", 10);
+        }
+        GGML_ASSERT(ggml_backend_meta_is_host_view(tensor));
+
+        // the view is not allocated in the meta buffer, it is not split across the sub-devices
+        return { GGML_BACKEND_SPLIT_AXIS_NONE, {0}, {1}, 1 };
     }
-    GGML_ASSERT(ggml_backend_buffer_is_meta(tensor->buffer));
+
     ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) tensor->buffer->context;
     return ggml_backend_meta_get_split_state(buf_ctx->get_simple_tensor_container(tensor), tensor, assume_sync);
 }
@@ -1632,11 +1654,6 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
     for (size_t j = 0; j < n_simple_bufs; j++) {
         ggml_context          * simple_ctx = stc.ctxs[j].get();
         ggml_backend_buffer_t   simple_buf = buf_ctx->bufs[j].get();
-
-        if ((simple_buf != nullptr) && ggml_backend_buffer_is_multi_buffer(simple_buf)) {
-            // see https://github.com/ggml-org/llama.cpp/issues/22197
-            GGML_ABORT("multi buffers are not supported by the meta backend");
-        }
 
         // A lane outside the mirror mask gets an empty tensor, which allocates nothing.
         if (mirror_lanes != 0) {
@@ -1713,16 +1730,27 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
                 }
             }
         }
+        // TODO: revisit once the graph allocator has been refactored, see https://github.com/ggml-org/llama.cpp/pull/25051#issuecomment-4842873396
+        ggml_backend_buffer_t init_buf = simple_buf;
         if (t_ij->view_src != nullptr) {
             t_ij->data = (char *) t_ij->view_src->data + t_ij->view_offs;
+            // views inherit the source slice's concrete sub-buffer (issue 22197)
+            if (tensor->view_src != nullptr && ggml_backend_buffer_is_meta(tensor->view_src->buffer)
+                    && t_ij->view_src->buffer != nullptr) {
+                t_ij->buffer = t_ij->view_src->buffer;
+                init_buf     = t_ij->view_src->buffer;
+            }
         } else if (simple_buf != nullptr) {
+            if (ggml_backend_buffer_is_multi_buffer(simple_buf)) {
+                GGML_ABORT("multi buffers are not supported by the meta backend");
+            }
             t_ij->data = (char *) ggml_backend_buffer_get_base(simple_buf)
                 + size_t(tensor->data) - size_t(ggml_backend_buffer_get_base(tensor->buffer));
         }
 
-        if (simple_buf) {
+        if (init_buf) {
             // the backend that owns the buffer will set .extra
-            ggml_backend_buffer_init_tensor(simple_buf, t_ij);
+            ggml_backend_buffer_init_tensor(init_buf, t_ij);
         } else {
             t_ij->extra = tensor->extra;
         }
@@ -2232,26 +2260,34 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_bac
     std::vector<ggml_backend_buffer_t> bufs;
     bufs.reserve(n_simple_bufts);
     for (size_t i = 0; i < n_simple_bufts; i++) {
-        bufs.push_back(ggml_backend_buft_alloc_buffer(ggml_backend_meta_buft_simple_buft(buft, i), size));
-        GGML_ASSERT(bufs.back() != nullptr);
-        max_size = std::max(max_size, ggml_backend_buffer_get_size(bufs.back()));
+        ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(ggml_backend_meta_buft_simple_buft(buft, i), size);
+        if (buf == nullptr) {
+            // A lane that cannot allocate is a failed buffer, not a fatal error.
+            // Reporting it the way every other buffer type does lets the caller fall back or fit a smaller layout, instead of aborting a context that was still being built.
+            for (ggml_backend_buffer_t allocated : bufs) {
+                ggml_backend_buffer_free(allocated);
+            }
+            return nullptr;
+        }
+        bufs.push_back(buf);
+        max_size = std::max(max_size, ggml_backend_buffer_get_size(buf));
     }
     ggml_backend_meta_buffer_context * buf_ctx = new ggml_backend_meta_buffer_context(stc_static, stc_compute_0, stc_compute_1, bufs);
 
     return ggml_backend_buffer_init(buft, ggml_backend_meta_buffer_iface, buf_ctx, max_size);
 }
 
-struct ggml_backend_buffer * ggml_backend_meta_alloc_ctx_tensors_from_buft(struct ggml_context * ctx, ggml_backend_buffer_type_t buft) {
+static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer_n(ggml_backend_buffer_type_t buft, ggml_tensor ** tensors, int n_tensors) {
     const size_t n_simple_bufts = ggml_backend_meta_buft_n_bufts(buft);
 
     constexpr size_t compute_headroom = 16; // Maximum number of views per statically allocated tensor that can be created between evals.
     const ggml_init_params params_static = {
-        /*.mem_size   =*/ ggml_get_mem_size(ctx),
+        /*.mem_size   =*/ n_tensors * ggml_tensor_overhead(),
         /*.mem_buffer =*/ nullptr,
         /*.no_alloc   =*/ true,
     };
     const ggml_init_params params_compute = {
-        /*.mem_size   =*/ compute_headroom*ggml_get_mem_size(ctx),
+        /*.mem_size   =*/ compute_headroom * n_tensors * ggml_tensor_overhead(),
         /*.mem_buffer =*/ nullptr,
         /*.no_alloc   =*/ true,
     };
@@ -2263,8 +2299,8 @@ struct ggml_backend_buffer * ggml_backend_meta_alloc_ctx_tensors_from_buft(struc
     ggml_backend_meta_buffer_context * meta_buf_ctx = new ggml_backend_meta_buffer_context(stc_static, stc_compute_0, stc_compute_1, bufs);
 
     ggml_backend_buffer_t meta_buf = ggml_backend_buffer_init(buft, ggml_backend_meta_buffer_iface, meta_buf_ctx, 0);
-    ggml_context * ctx_meta = ctx;
-    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+    for (int i = 0; i < n_tensors; i++) {
+        ggml_tensor * t = tensors[i];
         t->buffer = meta_buf;
         ggml_backend_meta_buffer_init_tensor_impl(meta_buf_ctx->stc_static, t);
         t->data = (void *) 0x2000000000000000; // FIXME
@@ -2296,9 +2332,9 @@ struct ggml_backend_buffer * ggml_backend_meta_alloc_ctx_tensors_from_buft(struc
             // tensors un-stamped, so llama reports "unable to allocate" and exits.
             GGML_LOG_ERROR("%s: failed to allocate the %s slice %zu of a meta buffer%c",
                 __func__, ggml_backend_buft_name(simple_buft), i, 10);
-            for (ggml_tensor * t = ggml_get_first_tensor(ctx_meta); t != nullptr; t = ggml_get_next_tensor(ctx_meta, t)) {
-                t->buffer = nullptr;
-                t->data   = nullptr;
+            for (int k = 0; k < n_tensors; k++) {
+                tensors[k]->buffer = nullptr;
+                tensors[k]->data   = nullptr;
             }
             ggml_backend_buffer_free(meta_buf);
             return nullptr;
@@ -2604,6 +2640,9 @@ struct ggml_backend_meta_context {
     // the barrier bills for them) collapse to one per token. On by default,
     // GGML_META_TOKEN_GRAPH=0 goes back to per-subgraph dispatch.
     bool token_graph = false;
+    // sub-backend entry point that switches off its per-subgraph graph cache
+    void (*graph_cache_disable)(ggml_backend_t) = nullptr;
+    bool inner_graphs_disabled = false;
     bool (*tg_capture_begin)(ggml_backend_t)        = nullptr;
     void * (*tg_capture_end)(ggml_backend_t)        = nullptr;
     void (*tg_graph_launch)(ggml_backend_t, void *) = nullptr;
@@ -2616,6 +2655,7 @@ struct ggml_backend_meta_context {
         size_t              stage     = 0;
         size_t              i_beg     = 0;   // first subgraph in the run
         size_t              i_end     = 0;   // one past the last
+        size_t              seam      = SIZE_MAX; // TRANSFER subgraph that ends the run, SIZE_MAX for the last one
         std::vector<void *> exec;            // one graph per lane of this stage
     };
     struct tg_entry {
@@ -2724,6 +2764,15 @@ struct ggml_backend_meta_context {
     uint64_t prof_ns_close   = 0;
     uint64_t prof_ns_sync    = 0;
     uint64_t prof_ns_wall0   = 0;
+    // Replayed whole-token graphs form their own class: prefill and uncaptured
+    // shapes would otherwise average into the per-token numbers. launch is the
+    // host time issuing the recorded graphs, seam the stage transfers between them.
+    bool     prof_last_tg       = false;
+    uint64_t prof_tg_calls      = 0;
+    uint64_t prof_tg_ns_compute = 0;
+    uint64_t prof_tg_ns_launch  = 0;
+    uint64_t prof_tg_ns_seam    = 0;
+    uint64_t prof_tg_ns_sync    = 0;
 
     void prof_report() const {
         if (!prof || prof_calls == 0) {
@@ -2744,6 +2793,21 @@ struct ggml_backend_meta_context {
             100.0 * prof_ns_compute / wall,
             100.0 * prof_ns_sync    / wall,
             wall / 1e9);
+        if (prof_tg_calls > 0) {
+            const double t = (double) prof_tg_calls;
+            const double o = (double) (prof_calls - prof_tg_calls);
+            fprintf(stderr,
+                "[meta-prof] replayed tokens=%llu | per token: compute=%.1f us (launch=%.1f seam=%.1f)  sync=%.1f us | "
+                "other calls=%llu: compute=%.1f us  sync=%.1f us\n",
+                (unsigned long long) prof_tg_calls,
+                prof_tg_ns_compute / t / 1e3,
+                prof_tg_ns_launch  / t / 1e3,
+                prof_tg_ns_seam    / t / 1e3,
+                prof_tg_ns_sync    / t / 1e3,
+                (unsigned long long) (prof_calls - prof_tg_calls),
+                o > 0 ? (prof_ns_compute - prof_tg_ns_compute) / o / 1e3 : 0.0,
+                o > 0 ? (prof_ns_sync    - prof_tg_ns_sync)    / o / 1e3 : 0.0);
+        }
     }
 
     // Sync-fallback scratch for set_tensor_async on layouts the chunk-by-chunk path can't handle:
@@ -2871,6 +2935,8 @@ struct ggml_backend_meta_context {
                     ggml_backend_reg_get_proc_address(simple_reg, "ggml_backend_token_graph_launch");
                 tg_graph_free = (void (*)(ggml_backend_t, void *))
                     ggml_backend_reg_get_proc_address(simple_reg, "ggml_backend_token_graph_free");
+                graph_cache_disable = (void (*)(ggml_backend_t))
+                    ggml_backend_reg_get_proc_address(simple_reg, "ggml_backend_graph_cache_disable");
                 break;
             }
         }
@@ -3313,6 +3379,7 @@ static void ggml_backend_meta_synchronize(ggml_backend_t backend) {
     }
     ggml_backend_meta_context * prof_ctx = (ggml_backend_meta_context *) backend->context;
     ggml_meta_prof_scope prof_guard(&prof_ctx->prof_ns_sync, prof_ctx->prof);
+    ggml_meta_prof_scope prof_guard_tg(&prof_ctx->prof_tg_ns_sync, prof_ctx->prof && prof_ctx->prof_last_tg);
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
     for (size_t i = 0; i < n_backends; i++) {
         ggml_backend_synchronize(ggml_backend_meta_simple_backend(backend, i));
@@ -3347,6 +3414,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     ggml_meta_chunk_trace_guard chunk_guard(backend_ctx->dbg_chunk, cgraph);
     ggml_meta_prof_scope prof_guard(&backend_ctx->prof_ns_compute, backend_ctx->prof);
     backend_ctx->prof_calls += backend_ctx->prof ? 1 : 0;
+    backend_ctx->prof_last_tg = false;
+    if (backend_ctx->prof && (backend_ctx->prof_calls % 512) == 0) {
+        backend_ctx->prof_report();
+    }
 
     // If the previous cgraph had a defined UID it can be used to skip rebuilding the subgraphs per simple backend.
     const bool needs_rebuild = (cgraph->uid == 0) || (cgraph->uid != backend_ctx->uid);
@@ -3402,6 +3473,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     backend_ctx->graph_has_moe_ops = true;
                 }
                 if (node->buffer == nullptr || !ggml_backend_buffer_is_meta(node->buffer)) {
+                    // [TAG_META_HOST_VIEWS]
                     // A node that is not backed by a meta buffer is a view over a tensor
                     // computed elsewhere (s_copy_main on the CPU, or the token embedding
                     // when a device-resident node precedes hc_init and the scheduler
@@ -4403,20 +4475,22 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             if (node->flags & GGML_TENSOR_FLAG_COMPUTE) {
                 continue;
             }
-            ggml_tensor * node_zero = get_node_aux(node);
-            node_zero->op = GGML_OP_SCALE; // FIXME 0.0f * NaN == NaN
-            node_zero->src[0] = node;
-            ggml_set_op_params_f32(node_zero, 0, 0.0f);
-            node_zero->data = node->data;
-            node_zero->buffer = node->buffer;
-            node_zero->flags |= GGML_TENSOR_FLAG_COMPUTE;
+            if (ggml_nelements(node) > 0) {
+                ggml_tensor * node_zero = get_node_aux(node);
+                node_zero->op = GGML_OP_FILL;
+                node_zero->src[0] = node; // only used for the shape, the data is not read
+                ggml_set_op_params_f32(node_zero, 0, 0.0f);
+                node_zero->data = node->data;
+                node_zero->buffer = node->buffer;
+                node_zero->flags |= GGML_TENSOR_FLAG_COMPUTE;
 
-            step_cgraphs[k] = get_cgraph_aux();
-            step_cgraphs[k]->nodes[0] = node_zero;
-            step_cgraphs[k]->n_nodes = 1;
-            const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, step_cgraphs[k]);
-            if (status != GGML_STATUS_SUCCESS) {
-                return status;
+                step_cgraphs[k] = get_cgraph_aux();
+                step_cgraphs[k]->nodes[0] = node_zero;
+                step_cgraphs[k]->n_nodes = 1;
+                const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, step_cgraphs[k]);
+                if (status != GGML_STATUS_SUCCESS) {
+                    return status;
+                }
             }
         }
         std::fill(step_cgraphs.begin(), step_cgraphs.end(), nullptr);
@@ -4927,6 +5001,16 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         backend_ctx->tps > 1 && backend_ctx->n_stages * backend_ctx->tps == n_backends &&
         backend_ctx->comm_ctxs.size() >= backend_ctx->n_stages) {
 
+        // The token graph records every kernel of the token, so the lanes' own per-subgraph caches only add recording work on top.
+        if (!backend_ctx->inner_graphs_disabled && backend_ctx->n_stages == 1 &&
+                backend_ctx->graph_cache_disable != nullptr) {
+            for (size_t j = 0; j < n_backends; j++) {
+                backend_ctx->graph_cache_disable(backend_ctx->backend_configs[j].backend);
+            }
+            backend_ctx->inner_graphs_disabled = true;
+            GGML_LOG_DEBUG("%s: token graph owns the token, per-subgraph graph caches off\n", __func__);
+        }
+
         auto * tge = backend_ctx->tg_lookup(cgraph->uid);
 
         // Replay. Each run is one launch per lane of its stage, then the stage transfer
@@ -4941,12 +5025,33 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 if (!ready) { break; }
             }
             if (ready) {
+                const uint64_t prof_t0 = backend_ctx->prof ? ggml_meta_prof_now() : 0;
+                uint64_t prof_seam = 0;
                 for (const auto & r : tge->runs) {
                     const size_t lane_lo = r.stage * backend_ctx->tps;
                     for (size_t k = 0; k < backend_ctx->tps; k++) {
                         backend_ctx->tg_graph_launch(
                             backend_ctx->backend_configs[lane_lo + k].backend, r.exec[k]);
                     }
+                    if (r.seam != SIZE_MAX) {
+                        const size_t stage_b = backend_ctx->subgraphs[r.seam + 1].stage;
+                        const uint64_t prof_ts = backend_ctx->prof ? ggml_meta_prof_now() : 0;
+                        const ggml_status st = stage_transfer(r.seam, r.stage, stage_b);
+                        if (backend_ctx->prof) {
+                            prof_seam += ggml_meta_prof_now() - prof_ts;
+                        }
+                        if (st != GGML_STATUS_SUCCESS) {
+                            return st;
+                        }
+                    }
+                }
+                if (backend_ctx->prof) {
+                    const uint64_t prof_t1 = ggml_meta_prof_now();
+                    backend_ctx->prof_tg_calls++;
+                    backend_ctx->prof_tg_ns_launch  += (prof_t1 - prof_t0) - prof_seam;
+                    backend_ctx->prof_tg_ns_seam    += prof_seam;
+                    backend_ctx->prof_tg_ns_compute += prof_t1 - prof_guard.t0;
+                    backend_ctx->prof_last_tg = true;
                 }
                 if (tge->covered >= backend_ctx->n_subgraphs) {
                     return GGML_STATUS_SUCCESS;
@@ -5006,10 +5111,12 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                         break;
                     }
                     if (sg.closure == ggml_backend_meta_context::subgraph_closure::TRANSFER) {
-                        // multi-stage shapes are not captured
-                        runs.clear();
+                        // A stage seam ends the run. Its nodes belong to the stage that produced them and stay inside the capture.
+                        // The transfer itself is host work between two launches, so it is replayed, not recorded.
+                        cur.seam = i;
+                        runs.push_back(cur);
                         open = false;
-                        break;
+                        continue;
                     }
                 }
                 if (open) {
@@ -5017,10 +5124,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 }
             }
 
-            // Multi-stage capture stays off: it produced wrong results on MoE
-            // targets and measured no win, the stage transfer reintroduces the
-            // barrier skew the capture removes.
-            bool eligible = !runs.empty() && backend_ctx->n_stages == 1;
+            // A multi-stage shape captures one run per stage, with the seam transfers replayed between them.
+            bool eligible = !runs.empty();
             for (const auto & r : runs) {
                 if (r.i_end <= r.i_beg) { eligible = false; break; }
                 if (backend_ctx->comm_ctxs[r.stage] == nullptr) { eligible = false; break; }
@@ -5087,6 +5192,13 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                         for (size_t k = 0; k < backend_ctx->tps; k++) {
                             backend_ctx->tg_graph_launch(
                                 backend_ctx->backend_configs[lane_lo + k].backend, r.exec[k]);
+                        }
+                        if (r.seam != SIZE_MAX) {
+                            const size_t stage_b = backend_ctx->subgraphs[r.seam + 1].stage;
+                            const ggml_status st = stage_transfer(r.seam, r.stage, stage_b);
+                            if (st != GGML_STATUS_SUCCESS) {
+                                return st;
+                            }
                         }
                     }
                     GGML_LOG_DEBUG("%s: uid %zu captured %zu runs x %zu lanes, %zu/%zu subgraphs\n",
