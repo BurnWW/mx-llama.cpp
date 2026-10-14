@@ -1721,6 +1721,126 @@ size_t server_prompt_cache::n_tokens() const {
     return res;
 }
 
+// ---------------------------------------------------------------------------
+// 内存水位 (防 OOM)
+// ---------------------------------------------------------------------------
+// prompt cache 跑在容器里, 而容器通常没有内存上限 —— 一旦 --cache-ram 配得比
+// "宿主/容器实际能给的"还大, 内核 OOM killer 会在缓存到达限额**之前**直接杀掉
+// llama-server (2026-10-01 实测: 32768 MiB 限额 + 45 GiB 宿主 + 18 GiB 模型 → 被杀,
+// 且 /cache/kv 一直是空的 —— 溢写路径根本没机会跑)。
+//
+// 这里给 RAM 层加一个动态上限: min(--cache-ram, 可用内存 − 保留量)。
+//   LLAMA_CACHE_RAM_RESERVE_MIB  保留量, 默认 4096 MiB; 0 = 关闭水位保护
+// 可用内存: cgroup v2/v1 限额优先 (容器设了 --memory 时), 否则 /proc/meminfo 的
+// MemAvailable。触发时最老的条目照常**溢写到 L3 磁盘**(不丢数据), 只是更早换层。
+//
+// 注意这是动态水位: 缓存自身占用会让 available 下降, 所以稳态下缓存约收敛到
+// (可用 − 保留)/2 (推导: S + new ≤ (A − S) − R)。保守是刻意的 —— 宁可早换层,
+// 也不让内核 OOM 杀进程。
+// ---------------------------------------------------------------------------
+namespace {
+
+bool pc_read_u64_file(const char * path, uint64_t & out) {
+    FILE * f = fopen(path, "rb");
+    if (f == nullptr) {
+        return false;
+    }
+
+    char buf[64] = {0};
+    const size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    if (n == 0) {
+        return false;
+    }
+
+    if (strncmp(buf, "max", 3) == 0) {
+        return false; // cgroup v2: 不限
+    }
+
+    char * end = nullptr;
+    const unsigned long long v = strtoull(buf, &end, 10);
+    if (end == buf) {
+        return false;
+    }
+
+    out = (uint64_t) v;
+    return true;
+}
+
+// 进程还能安全使用的内存 (字节; 0 = 读不到)
+size_t pc_mem_available() {
+    uint64_t lim = 0, cur = 0;
+
+    // cgroup v2 (容器设了 --memory 时以它为准)
+    if (pc_read_u64_file("/sys/fs/cgroup/memory.max", lim) &&
+        pc_read_u64_file("/sys/fs/cgroup/memory.current", cur) && lim > cur) {
+        return (size_t) (lim - cur);
+    }
+
+    // cgroup v1
+    if (pc_read_u64_file("/sys/fs/cgroup/memory/memory.limit_in_bytes", lim) &&
+        pc_read_u64_file("/sys/fs/cgroup/memory/memory.usage_in_bytes", cur) &&
+        lim > cur && lim < (1ull << 60)) {
+        return (size_t) (lim - cur);
+    }
+
+    // 容器无内存上限 → 看宿主 (/proc/meminfo 不被 namespace 隔离)
+    FILE * f = fopen("/proc/meminfo", "rb");
+    if (f == nullptr) {
+        return 0;
+    }
+
+    char line[256];
+    size_t out = 0;
+    while (fgets(line, sizeof(line), f) != nullptr) {
+        unsigned long long kb = 0;
+        if (sscanf(line, "MemAvailable: %llu kB", &kb) == 1) {
+            out = (size_t) kb * 1024;
+            break;
+        }
+    }
+    fclose(f);
+    return out;
+}
+
+size_t pc_ram_reserve() {
+    static const size_t v = []() -> size_t {
+        const char * s = getenv("LLAMA_CACHE_RAM_RESERVE_MIB");
+        if (s != nullptr && *s != '\0') {
+            const long mib = strtol(s, nullptr, 10);
+            return mib > 0 ? (size_t) mib * 1024 * 1024 : 0; // 0/负 = 关闭水位保护
+        }
+        return (size_t) 4096 * 1024 * 1024;
+    }();
+    return v;
+}
+
+} // namespace
+
+// limit_size_eff 当前生效的 RAM 上限 = min(--cache-ram, 可用内存 − 保留量)。
+// 水位告急(可用 ≤ 保留)时压到 1 字节 → 全部溢写到磁盘 (0 在旧语义里是"不限", 不能用)。
+// 水位读不到 / 保护关着时, 退回 --cache-ram 的原始语义。
+size_t server_prompt_cache::limit_size_eff() const {
+    const size_t reserve = pc_ram_reserve();
+    if (reserve == 0) {
+        return limit_size;
+    }
+
+    const size_t avail = pc_mem_available();
+    if (avail == 0) {
+        return limit_size; // 读不到水位 → 不额外收紧
+    }
+    if (avail <= reserve) {
+        return 1; // 告急: 全量换层
+    }
+
+    const size_t budget = avail - reserve;
+    if (limit_size == 0 || budget < limit_size) {
+        return budget;
+    }
+    return limit_size;
+}
+
 server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft) {
     // first check if the current state is contained fully in the cache
     for (auto it = states.begin(); it != states.end(); ++it) {
@@ -1740,10 +1860,13 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
 
     const size_t state_size_new = state_size_tgt + state_size_dft + checkpoints_size;
 
+    // 水位: 上限取 min(--cache-ram, 可用内存 − 保留) —— 见 limit_size_eff()
+    const size_t limit_eff = limit_size_eff();
+
     // skip over-limit entries to avoid disturbing the cache
-    if (limit_size > 0 && state_size_new > limit_size) {
+    if (limit_eff > 0 && state_size_new > limit_eff) {
         SRV_WRN(" - prompt state size %.3f MiB exceeds cache size limit %.3f MiB, skipping\n",
-                state_size_new / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0));
+                state_size_new / (1024.0 * 1024.0), limit_eff / (1024.0 * 1024.0));
         return nullptr;
     }
 
@@ -1760,12 +1883,16 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         }
     }
 
-    if (limit_size > 0) {
+    if (limit_eff > 0) {
         // make room before allocating the new vectors to avoid breaching the limit
-        while (!states.empty() && size() + state_size_new > limit_size) {
-            SRV_WRN(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
+        while (!states.empty() && size() + state_size_new > limit_eff) {
+            SRV_WRN(" - making room for prompt cache entry, pushing oldest entry to disk (size = %.3f MiB)\n",
                     states.front().size() / (1024.0 * 1024.0));
 
+            // L3: 与 update() 一致 —— 磁盘层开着就溢写, 关着则退回旧行为(直接丢)。
+            // (旧实现直接 pop_front() 丢掉, 是「溢写」路径的一个漏: 新状态较大时
+            //  走的是这条分支, 最老的缓存会被静默丢弃而不是搬到磁盘。)
+            disk_write(std::move(states.front()));
             states.pop_front();
         }
     }
@@ -1801,6 +1928,54 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     });
 
     return &states.back();
+}
+
+// save_to_disk_only 状态超过 RAM 限额时的兜底: 不塞进 RAM 层, 直接构造一份临时 state 落盘。
+// 为什么需要(2026-10-01): 137k token 的会话状态可达 10+ GiB, 一旦超过 --cache-ram (或
+// 被水位收紧后的上限), 旧行为是**完全不缓存** → 下次冷预填 20+ 分钟; 而 L3 磁盘装得下。
+// 磁盘层关着时返回 false, 与旧行为完全一致。
+bool server_prompt_cache::save_to_disk_only(const server_prompt & prompt, llama_context * ctx_tgt, llama_context * ctx_dft,
+                                            int32_t id_slot, size_t state_size_tgt, size_t state_size_dft) {
+    if (disk_dir.empty()) {
+        return false; // 磁盘层没开 → 与旧行为一致: 不缓存
+    }
+
+    // 已经被 RAM 层里更长的状态包含 → 不必落盘
+    for (const auto & st : states) {
+        if (st.prompt.tokens.get_common_prefix(prompt.tokens) == (int) prompt.tokens.size()) {
+            return false;
+        }
+    }
+
+    // 落盘要先把整份状态构到内存里 —— 水位不够就放弃, 避免"为了缓存反而 OOM"
+    const size_t need  = state_size_tgt + state_size_dft;
+    const size_t avail = pc_mem_available();
+    if (avail != 0 && avail < need + pc_ram_reserve()) {
+        SRV_WRN(" - prompt state %.3f MiB exceeds RAM limit and memory is tight (available %.3f MiB), not cached\n",
+                need / (1024.0 * 1024.0), avail / (1024.0 * 1024.0));
+        return false;
+    }
+
+    server_prompt_cache_state st;
+    st.prompt.tokens      = prompt.tokens.clone();
+    st.prompt.checkpoints = prompt.checkpoints;
+
+    try {
+        st.data.main.resize(state_size_tgt);
+        st.data.drft.resize(state_size_dft);
+    } catch (const std::bad_alloc & e) {
+        SRV_ERR("failed to allocate memory for oversized prompt state: %s\n", e.what());
+        return false;
+    }
+
+    llama_state_seq_get_data_ext(ctx_tgt, st.data.main.data(), state_size_tgt, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE);
+    if (ctx_dft != nullptr) {
+        llama_state_seq_get_data_ext(ctx_dft, st.data.drft.data(), state_size_dft, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE);
+    }
+
+    SRV_WRN(" - prompt state %.3f MiB exceeds RAM limit, spilling straight to disk (L3)\n", need / (1024.0 * 1024.0));
+
+    return disk_write(std::move(st));
 }
 
 bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
@@ -1884,8 +2059,17 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 }
 
 void server_prompt_cache::update() {
-    if (limit_size > 0) {
-        while (!states.empty() && size() > limit_size) {
+    // 水位保护: 上限可能被「可用内存 − 保留」收紧 (见 limit_size_eff)
+    const size_t limit_eff = limit_size_eff();
+    if (limit_eff != limit_size && limit_eff != limit_size_wm_last) {
+        SRV_WRN(" - RAM watermark: prompt cache limit clamped %.3f MiB -> %.3f MiB (reserve %.3f MiB)\n",
+                limit_size / (1024.0 * 1024.0), limit_eff / (1024.0 * 1024.0),
+                pc_ram_reserve() / (1024.0 * 1024.0));
+        limit_size_wm_last = limit_eff;
+    }
+
+    if (limit_eff > 0) {
+        while (!states.empty() && size() > limit_eff) {
             SRV_WRN(" - cache size limit reached, pushing oldest entry to disk (size = %.3f MiB)\n", states.front().size() / (1024.0 * 1024.0));
 
             // L3: 磁盘层开着就溢写到磁盘(后台线程), 关着则退回旧行为(直接丢)
@@ -1898,7 +2082,7 @@ void server_prompt_cache::update() {
     const float size_per_token = std::max<float>(1.0f, float(size()) / (std::max<size_t>(1, n_tokens())));
 
     // dynamically increase the token limit if it can fit in the memory limit
-    const size_t limit_tokens_cur = limit_size > 0 ? std::max<size_t>(limit_tokens, limit_size/size_per_token) : limit_tokens;
+    const size_t limit_tokens_cur = limit_eff > 0 ? std::max<size_t>(limit_tokens, limit_eff/size_per_token) : limit_tokens;
 
     if (limit_tokens > 0) {
         while (!states.empty() && n_tokens() > limit_tokens_cur) {
@@ -1930,7 +2114,13 @@ void server_prompt_cache::update() {
 namespace {
 
 constexpr uint32_t KVCD_MAGIC   = 0x4b564344; // 'C''D''V''K' (固定即可, 只求自洽)
-constexpr uint32_t KVCD_VERSION = 1;
+constexpr uint32_t KVCD_VERSION = 2; // v2: 头部含模型签名 (v1 文件一律忽略)
+
+// disk_load 等待在飞写入落盘的上限 (毫秒)。GB 级文件写 10-20 秒, 给足余量 ——
+// 等十几秒远好过整段冷预填 (145k token ≈ 10.5 分钟)。
+// 注意: disk_load 在服务器主循环线程上跑, 等待期间整个批处理会暂停 —— 所以上限
+// 要短 (宁可放弃回退冷预填, 也不能长时间卡住其他槽的生成)。
+constexpr int64_t disk_wait_ms = 30 * 1000;
 
 template<typename T>
 void kvcd_w(std::ostream & os, const T & v) {
@@ -1976,17 +2166,35 @@ uint64_t kvcd_fnv1a(const void * data, size_t size) {
 }
 
 // 读一个磁盘条目。head_only = true 时只读 tokens (扫描索引/前缀匹配用), 不读 KV 大块。
-bool kvcd_read_entry(const std::string & path, bool head_only, server_tokens & tokens, server_prompt_cache_state * st) {
+bool kvcd_read_entry(const std::string & path, bool head_only, const std::string & expect_sig, server_tokens & tokens, server_prompt_cache_state * st) {
     std::ifstream is(path, std::ios::binary);
     if (!is) {
         return false;
     }
 
-    uint32_t magic = 0, version = 0, has_mtmd = 0, len = 0;
-    if (!kvcd_r(is, magic) || !kvcd_r(is, version) || !kvcd_r(is, has_mtmd) || !kvcd_r(is, len)) {
+    uint32_t magic = 0, version = 0, sig_len = 0, has_mtmd = 0, len = 0;
+    if (!kvcd_r(is, magic) || !kvcd_r(is, version) || !kvcd_r(is, sig_len)) {
         return false;
     }
     if (magic != KVCD_MAGIC || version != KVCD_VERSION) {
+        return false; // 老版本/异版本: 忽略 (v1 没签名)
+    }
+
+    // 模型签名校验: 不匹配 = 别人的 KV (共用目录时会出现) → 不认它, 不动它
+    if (sig_len > 0 && sig_len < 4096) {
+        std::string sig(sig_len, '\0');
+        is.read(sig.data(), (std::streamsize) sig_len);
+        if (!is) {
+            return false;
+        }
+        if (sig != expect_sig) {
+            return false;
+        }
+    } else if (!expect_sig.empty()) {
+        return false; // 要求有签名, 但这份没有
+    }
+
+    if (!kvcd_r(is, has_mtmd) || !kvcd_r(is, len)) {
         return false;
     }
 
@@ -2047,12 +2255,25 @@ bool kvcd_read_entry(const std::string & path, bool head_only, server_tokens & t
 } // namespace
 
 void server_prompt_cache::disk_init_from_env() {
+    // 先算文件名前缀 (只认自己的条目): fnv1a(签名) 的 16 进制
+    if (disk_sig.empty()) {
+        disk_prefix = "nosig-";
+    } else {
+        char hex[32];
+        snprintf(hex, sizeof(hex), "%016llx", (unsigned long long) kvcd_fnv1a(disk_sig.data(), disk_sig.size()));
+        disk_prefix = std::string(hex) + "-";
+    }
+
     const char * dir = getenv("LLAMA_CACHE_DISK_DIR");
     if (dir == nullptr || dir[0] == '\0') {
         return; // 默认关闭: 行为与打补丁前**完全一致**
     }
 
     disk_dir = dir;
+
+    if (disk_sig.empty()) {
+        SRV_WRN("%s: L3 disk cache has NO model signature — do NOT share disk_dir across models (KV layouts differ)\n", __func__);
+    }
 
     const char * mib = getenv("LLAMA_CACHE_DISK_MIB");
     if (mib != nullptr && mib[0] != '\0') {
@@ -2097,6 +2318,10 @@ void server_prompt_cache::disk_scan() {
         if (name.size() < 4 || name.compare(name.size() - 3, 3, ".kv") != 0) {
             continue;
         }
+        // 只认自己签名前缀的条目 —— 别的模型/无签名的文件原地不动 (它们归那边用)
+        if (name.compare(0, disk_prefix.size(), disk_prefix) != 0) {
+            continue;
+        }
 
         disk_entry e;
         e.path = de.path().string();
@@ -2109,7 +2334,7 @@ void server_prompt_cache::disk_scan() {
 
         // 只读头部拿 tokens (够前缀匹配), 不读 KV 大块
         server_tokens toks;
-        if (!kvcd_read_entry(e.path, /*head_only =*/ true, toks, nullptr)) {
+        if (!kvcd_read_entry(e.path, /*head_only =*/ true, disk_sig, toks, nullptr)) {
             SRV_WRN("%s: dropping unreadable disk cache entry '%s'\n", __func__, name.c_str());
             std::error_code ec3;
             std::filesystem::remove(e.path, ec3);
@@ -2167,7 +2392,7 @@ bool server_prompt_cache::disk_write(server_prompt_cache_state st) {
 
     char hex[32];
     snprintf(hex, sizeof(hex), "%016llx", (unsigned long long) kvcd_fnv1a(packed.data(), packed.size()));
-    const std::string path = disk_dir + "/" + hex + ".kv";
+    const std::string path = disk_dir + "/" + disk_prefix + hex + ".kv";
 
     const size_t bytes = st.size() + packed.size() + 64;
 
@@ -2177,7 +2402,14 @@ bool server_prompt_cache::disk_write(server_prompt_cache_state st) {
 
         for (const auto & e : disk_index) {
             if (e.path == path) {
-                return true; // 同一份已在盘上
+                // 2026-10-03: 只信「文件真的在」的条目 —— 写入线程失败时索引条目会残留,
+                // 旧逻辑直接 return true 会把这种幽灵条目当成已在盘上, 之后永远召不回。
+                std::error_code ec_ex;
+                const bool on_disk = std::filesystem::exists(path, ec_ex);
+                if (on_disk) {
+                    return true; // 同一份已在盘上
+                }
+                break; // 幽灵条目: 继续往下走, 重新写一份
             }
         }
 
@@ -2193,60 +2425,86 @@ bool server_prompt_cache::disk_write(server_prompt_cache_state st) {
         disk_evict_to_budget();
     }
 
+    // 登记「在飞写入」: disk_load 选中本条目时会在 disk_wcv 上等它落盘 (见 disk_load)。
+    {
+        std::lock_guard<std::mutex> lk(disk_wmu);
+        disk_writing.insert(path);
+    }
+
     // GB 级 IO 放后台线程 —— update() 在请求热路径上, 不能让它等盘。
     // 这份 state 已经从 states 里移出来了, 没有别人碰它, 所以可以安全地 move 进线程。
     std::thread([this, st = std::move(st), path, packed = std::move(packed)]() mutable {
         std::error_code ec;
         const std::string tmp = path + ".tmp";
+        bool ok = false;
         {
             std::ofstream os(tmp, std::ios::binary | std::ios::trunc);
             if (!os) {
-                return;
+                // 2026-10-03: 旧逻辑这里静默返回 —— 索引里却留着条目, 之后召回应声落空
+                SRV_WRN("%s: cannot open '%s' for writing, disk spill dropped\n", "disk_write", tmp.c_str());
+            } else {
+                kvcd_w(os, KVCD_MAGIC);
+                kvcd_w(os, KVCD_VERSION);
+                kvcd_w(os, (uint32_t) disk_sig.size());
+                if (!disk_sig.empty()) {
+                    os.write(disk_sig.data(), (std::streamsize) disk_sig.size());
+                }
+                kvcd_w(os, (uint32_t) st.prompt.tokens.has_mtmd);
+                kvcd_w(os, (uint32_t) packed.size());
+                if (!packed.empty()) {
+                    os.write(packed.data(), packed.size());
+                }
+
+                kvcd_w(os, (uint32_t) st.prompt.checkpoints.size());
+                for (const auto & c : st.prompt.checkpoints) {
+                    kvcd_w(os, (int64_t) c.n_tokens);
+                    kvcd_w(os, (int32_t) c.id_task);
+                    kvcd_w(os, (int32_t) c.pos_min);
+                    kvcd_w(os, (int32_t) c.pos_max);
+                    kvcd_wbuf(os, c.data_tgt);
+                    kvcd_wbuf(os, c.data_dft);
+                    kvcd_wbuf(os, c.data_spec);
+                }
+
+                kvcd_wbuf(os, st.data.main);
+                kvcd_wbuf(os, st.data.drft);
+
+                os.flush();
+                if (!os) {
+                    SRV_WRN("%s: write '%s' failed, disk spill dropped\n", "disk_write", tmp.c_str());
+                    std::filesystem::remove(tmp, ec);
+                } else {
+                    ok = true;
+                }
             }
+        }
 
-            kvcd_w(os, KVCD_MAGIC);
-            kvcd_w(os, KVCD_VERSION);
-            kvcd_w(os, (uint32_t) st.prompt.tokens.has_mtmd);
-            kvcd_w(os, (uint32_t) packed.size());
-            if (!packed.empty()) {
-                os.write(packed.data(), packed.size());
-            }
-
-            kvcd_w(os, (uint32_t) st.prompt.checkpoints.size());
-            for (const auto & c : st.prompt.checkpoints) {
-                kvcd_w(os, (int64_t) c.n_tokens);
-                kvcd_w(os, (int32_t) c.id_task);
-                kvcd_w(os, (int32_t) c.pos_min);
-                kvcd_w(os, (int32_t) c.pos_max);
-                kvcd_wbuf(os, c.data_tgt);
-                kvcd_wbuf(os, c.data_dft);
-                kvcd_wbuf(os, c.data_spec);
-            }
-
-            kvcd_wbuf(os, st.data.main);
-            kvcd_wbuf(os, st.data.drft);
-
-            os.flush();
-            if (!os) {
+        if (ok) {
+            std::filesystem::rename(tmp, path, ec);
+            if (ec) {
+                SRV_WRN("%s: rename '%s' failed: %s\n", "disk_write", path.c_str(), ec.message().c_str());
                 std::filesystem::remove(tmp, ec);
-                return;
+                ok = false;
             }
         }
 
-        std::filesystem::rename(tmp, path, ec);
-        if (ec) {
-            SRV_WRN("%s: rename '%s' failed: %s\n", __func__, path.c_str(), ec.message().c_str());
-            std::filesystem::remove(tmp, ec);
-            return;
-        }
-
-        std::lock_guard<std::mutex> lk(disk_mu);
-        for (auto & e : disk_index) {
-            if (e.path == path) {
-                e.mtime_us = ggml_time_us();
-                break;
+        if (ok) {
+            std::lock_guard<std::mutex> lk(disk_mu);
+            for (auto & e : disk_index) {
+                if (e.path == path) {
+                    e.mtime_us = ggml_time_us();
+                    break;
+                }
             }
         }
+
+        // 无论成败都摘掉「在飞写入」并唤醒等待者 (见 disk_load) —— 失败时等待方会在
+        // 超时/醒来后看到文件不存在, 打 WRN 再放弃 (而不是之前的静默冷预填)。
+        {
+            std::lock_guard<std::mutex> lk(disk_wmu);
+            disk_writing.erase(path);
+        }
+        disk_wcv.notify_all();
     }).detach();
 
     return true;
@@ -2254,7 +2512,7 @@ bool server_prompt_cache::disk_write(server_prompt_cache_state st) {
 
 bool server_prompt_cache::disk_read(const std::string & path, server_prompt_cache_state & out) {
     server_tokens toks;
-    if (!kvcd_read_entry(path, /*head_only =*/ false, toks, &out)) {
+    if (!kvcd_read_entry(path, /*head_only =*/ false, disk_sig, toks, &out)) {
         return false;
     }
     return true;
@@ -2269,6 +2527,11 @@ bool server_prompt_cache::disk_load(server_prompt & prompt, const server_tokens 
 
     // 1) 按 token 前缀挑最匹配的条目 (与 RAM 路径同一套 f_keep/f_sim 判据, 同一套基准)
     std::string best;
+    size_t      best_bytes = 0;
+    // 诊断 (2026-10-03): 记录最接近的 3 条 —— best.empty() 时打出来, 区分「真没有条目」
+    // 还是「有条目但都被判据挡住」(以前两种情况都静默, 事后完全查不出)。
+    struct cand_diag { size_t len; int lcp; float f_keep; float f_sim; };
+    std::vector<cand_diag> top3;
     {
         std::lock_guard<std::mutex> lk(disk_mu);
         disk_scan();
@@ -2283,6 +2546,18 @@ bool server_prompt_cache::disk_load(server_prompt & prompt, const server_tokens 
             const float f_keep_cur = float(lcp) / e.tokens.size();
             const float f_sim_cur  = float(lcp) / tokens_new.size();
 
+            // 诊断: 维护 top3 (按 f_sim)
+            if (top3.size() < 3 || f_sim_cur > top3.back().f_sim) {
+                cand_diag d{ e.tokens.size(), lcp, f_keep_cur, f_sim_cur };
+                top3.push_back(d);
+                std::sort(top3.begin(), top3.end(), [](const cand_diag & a, const cand_diag & b) {
+                    return a.f_sim > b.f_sim;
+                });
+                if (top3.size() > 3) {
+                    top3.pop_back();
+                }
+            }
+
             // don't trash large prompts (与 load() 里一致)
             if (f_keep_cur < 0.25f) {
                 continue;
@@ -2292,15 +2567,68 @@ bool server_prompt_cache::disk_load(server_prompt & prompt, const server_tokens 
                 f_keep_best = f_keep_cur;
                 f_sim_best  = f_sim_cur;
                 best        = e.path;
+                best_bytes  = e.bytes;
             }
         }
     }
 
     if (best.empty()) {
+        // 冷缓存里也没有更合适的 —— 打诊断 (最接近的 3 条), 下次有据可查。
+        // 降噪: 完全没相似度 (全新会话, 最接近的 f_sim < 0.05) 只打 TRC;
+        // 有相似度却被判据挡住 = 可疑情形 (前缀变了/被挤掉), 打 WRN。
+        std::string diag;
+        for (const auto & d : top3) {
+            char buf[128];
+            snprintf(buf, sizeof(buf), "[len=%zu lcp=%d f_keep=%.3f f_sim=%.3f]", d.len, d.lcp, d.f_keep, d.f_sim);
+            diag += buf;
+        }
+        const float top_sim = top3.empty() ? 0.0f : top3.front().f_sim;
+        if (top_sim >= 0.05f) {
+            SRV_WRN("%s: no disk cache entry matches (tokens_new = %zu, base f_keep = %.3f f_sim = %.3f); closest: %s\n",
+                    __func__, tokens_new.size(), f_keep_best, f_sim_best, diag.c_str());
+        } else {
+            SRV_TRC("%s: no disk cache entry matches (tokens_new = %zu); closest: %s\n",
+                    __func__, tokens_new.size(), diag.c_str());
+        }
         return false; // 冷缓存里也没有更合适的
     }
 
+    // 内存水位: 读回要先把整份状态构到宿主内存里 (GB 级) —— 装不下就放弃召回,
+    // 让这轮走冷预填 (而不是把进程推到 OOM)。
+    {
+        const size_t avail = pc_mem_available();
+        if (avail != 0 && best_bytes + pc_ram_reserve() > avail) {
+            SRV_WRN(" - disk cache entry is %.3f MiB but only %.3f MiB available (reserve %.3f MiB), skipping recall\n",
+                    best_bytes / (1024.0 * 1024.0), avail / (1024.0 * 1024.0), pc_ram_reserve() / (1024.0 * 1024.0));
+            return false;
+        }
+    }
+
     // 2) 读回来 (GB 级, 秒级 —— 冷召回本来就要付这个代价)
+    //    条目可能刚登记、文件还在后台线程写 (.tmp → rename 之间, GB 级要 10-20 秒) ——
+    //    此时直接读会扑空 → 静默冷预填 (2026-10-03 实测: 145k token 冷算 10.5 分钟)。
+    //    改为在 disk_wcv 上等写入线程收尾 (上限 disk_wait_ms), 把 10 分钟换成十几秒。
+    if (!std::filesystem::exists(best)) {
+        const int64_t t_wait0 = ggml_time_ms();
+        {
+            std::unique_lock<std::mutex> lk(disk_wmu);
+            if (disk_writing.count(best) > 0) {
+                SRV_WRN(" - disk cache entry is still being written, waiting up to %lld ms: %s\n",
+                        (long long) disk_wait_ms, best.c_str());
+                disk_wcv.wait_for(lk, std::chrono::milliseconds(disk_wait_ms),
+                                  [&]() { return disk_writing.count(best) == 0; });
+            }
+        }
+        std::error_code ec_ex;
+        if (!std::filesystem::exists(best, ec_ex)) {
+            SRV_WRN("%s: disk cache entry '%s' not available after %.1f s wait, skipping recall\n",
+                    __func__, best.c_str(), (ggml_time_ms() - t_wait0) / 1000.0);
+            return false;
+        }
+        SRV_WRN(" - disk cache entry ready after %.1f s wait, reading: %s\n",
+                (ggml_time_ms() - t_wait0) / 1000.0, best.c_str());
+    }
+
     server_prompt_cache_state st;
     if (!disk_read(best, st)) {
         SRV_WRN("%s: failed to read disk cache entry '%s'\n", __func__, best.c_str());

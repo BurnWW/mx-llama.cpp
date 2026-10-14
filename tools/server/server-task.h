@@ -8,6 +8,7 @@
 #include <list>
 #include <map>
 #include <mutex>
+#include <condition_variable>
 #include <vector>
 
 // TODO: prevent including the whole server-common.h as we only use server_tokens
@@ -616,9 +617,13 @@ struct server_prompt_cache_state {
 };
 
 struct server_prompt_cache {
-    server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens) {
+    server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens, const std::string & sig = "") {
         this->limit_size   = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
         this->limit_tokens = limit_tokens;
+
+        // 模型签名: 不同模型 / 不同 KV 量化 / 不同 n_ctx 的 KV 字节布局互不兼容。
+        // 共用同一个 LLAMA_CACHE_DISK_DIR 时必须靠它隔离 —— 否则会把别的模型的 KV 装进本槽 (乱码)。
+        this->disk_sig = sig;
 
         // L3 磁盘层(冷缓存): 默认关闭, 由 LLAMA_CACHE_DISK_DIR 开启
         disk_init_from_env();
@@ -636,7 +641,19 @@ struct server_prompt_cache {
 
     size_t n_tokens() const;
 
+    // RAM 上限的水位保护: 生效上限 = min(--cache-ram, 可用内存 − LLAMA_CACHE_RAM_RESERVE_MIB)。
+    // 水位告急时返回 1 (全部溢写到 L3 磁盘, 不丢数据) —— 防止 --cache-ram 配得比
+    // 宿主能给的还大时, 内核 OOM killer 在缓存到达限额之前直接杀进程。
+    // 见 server-task.cpp 里 limit_size_eff() 上方的说明。
+    size_t limit_size_eff() const;
+    size_t limit_size_wm_last = 0; // 上次打过水位收紧日志的值 (只在变化时打)
+
     server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
+
+    // 状态超过 RAM 限额时的兜底: 不塞进 RAM 层, 直接落盘到 L3 (磁盘层关着时返回 false,
+    // 与旧行为一致 —— 不缓存)。落盘前先看内存水位, 避免"为了缓存反而 OOM"。
+    bool save_to_disk_only(const server_prompt & prompt, llama_context * ctx_tgt, llama_context * ctx_dft,
+                           int32_t id_slot, size_t state_size_tgt, size_t state_size_dft);
 
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
 
@@ -668,11 +685,22 @@ struct server_prompt_cache {
     };
 
     std::string disk_dir;
+    std::string disk_sig;            // 模型签名 (见 ctor): 隔离不同模型的 KV
+    std::string disk_prefix;         // 文件名前缀 = fnv1a(disk_sig): 只扫/只认自己的条目
     size_t      limit_disk_size = 0; // 字节, 0 = 不限
     size_t      disk_size       = 0; // 当前占用 (字节)
     bool        disk_scanned    = false;
     std::mutex  disk_mu;             // 保护 disk_index / disk_size / disk_scanned
     std::vector<disk_entry> disk_index;
+
+    // 在飞写入 (2026-10-03): disk_write 先把路径登记进 disk_index, 文件在后台线程里
+    // 写 .tmp → rename。GB 级文件要 10-20 秒才可见 —— 这段窗口里 disk_load 按索引
+    // 选中条目却读不到文件, 会静默放弃 → 整段冷预填 (实测 145k token 冷算 10.5 分钟)。
+    // disk_load 现在会在此条件变量上等它写完 (上限 disk_wait_ms), 把 10 分钟换成
+    // 十几秒。写入线程无论成败都会 erase + notify (见 disk_write)。
+    std::mutex               disk_wmu;
+    std::condition_variable  disk_wcv;
+    std::unordered_set<std::string> disk_writing;
 
     void disk_init_from_env();
     void disk_scan();

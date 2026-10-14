@@ -431,7 +431,9 @@ struct server_slot {
 
         auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft);
         if (cur == nullptr) {
-            return false;
+            // 超过 RAM 限额(或水位收紧): RAM 装不下, 但 L3 磁盘装得下 —— 直接落盘,
+            // 免得整段会话丢缓存(下次冷预填 20+ 分钟)。磁盘层关着时它返回 false = 旧行为。
+            return prompt_cache.save_to_disk_only(prompt, ctx_tgt, ctx_dft, id, cur_size_tgt, cur_size_dft);
         }
 
         llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
@@ -1494,7 +1496,34 @@ private:
             }
             SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
 
-            prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
+            // L3 磁盘层的隔离签名: 模型描述/参数量/张量字节数 + KV 维度 + KV 量化类型 + n_ctx + 并行数 + 草稿模型。
+            // 不同模型的 KV 字节布局互不兼容 —— 没有签名, 共用 LLAMA_CACHE_DISK_DIR 就会把别人的 KV
+            // 装进本槽, 表现为乱码输出。
+            std::string cache_disk_sig;
+            {
+                char desc[256] = {0};
+                llama_model_desc(model_tgt, desc, sizeof(desc));
+                cache_disk_sig = std::string(desc)
+                    + "|np="  + std::to_string(llama_model_n_params(model_tgt))
+                    + "|sz="  + std::to_string(llama_model_size(model_tgt))
+                    + "|L="   + std::to_string(llama_model_n_layer(model_tgt))
+                    + "|E="   + std::to_string(llama_model_n_embd(model_tgt))
+                    + "|H="   + std::to_string(llama_model_n_head(model_tgt))
+                    + "|HK="  + std::to_string(llama_model_n_head_kv(model_tgt))
+                    + "|kt="  + ggml_type_name(params_base.cache_type_k)
+                    + "|vt="  + ggml_type_name(params_base.cache_type_v)
+                    + "|ctx=" + std::to_string(n_ctx)
+                    + "|par=" + std::to_string(params_base.n_parallel);
+                if (model_dft != nullptr) {
+                    char ddesc[256] = {0};
+                    llama_model_desc(model_dft, ddesc, sizeof(ddesc));
+                    cache_disk_sig += std::string("|dft=") + ddesc
+                        + "|dnp=" + std::to_string(llama_model_n_params(model_dft));
+                }
+            }
+            SRV_TRC("%s: L3 disk cache signature: %s\n", __func__, cache_disk_sig.c_str());
+
+            prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx, cache_disk_sig);
         } else {
             SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
         }
